@@ -6,7 +6,7 @@ members = ["boldi-vigna", "postgres", "tinql", "tokenizer"]
 version = "1.0.3"
 edition = "2024"
 authors = ["PlanetScale"]
-license = "AGPL-3.0-only"
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 hashbrown = "0.16.1"
