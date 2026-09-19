@@ -267,6 +267,43 @@ mod tests {
     }
 
     #[pg_test]
+    fn max_score_excludes_nonmatching_documents() {
+        for (name, matching, nonmatching, query) in [
+            (
+                "boolean",
+                "beer wine",
+                "beer beer beer beer beer",
+                "beer^1 AND wine^0",
+            ),
+            (
+                "phrase",
+                "beer beer wine",
+                "beer noise beer noise beer noise beer noise wine",
+                "\"beer beer\"^1 AND wine^0",
+            ),
+            (
+                "positional",
+                "beer wine",
+                "wine beer beer beer beer beer",
+                "beer BEFORE wine^0",
+            ),
+        ] {
+            Spi::run(&format!(
+                "CREATE TABLE lite_max_score_{name} (body text);
+                 INSERT INTO lite_max_score_{name} VALUES ('{matching}'), ('{nonmatching}');
+                 CREATE INDEX ON lite_max_score_{name} USING tin (body);"
+            ))
+            .unwrap();
+            let (score, max) = Spi::get_two::<f32, f32>(&format!(
+                "SELECT tin.full_score(ctid), tin.max_score(ctid)
+                 FROM lite_max_score_{name} WHERE body ==> '{query}'"
+            ))
+            .unwrap();
+            assert_eq!(max, score, "{name}");
+        }
+    }
+
+    #[pg_test]
     fn full_score_normalization_matches_tin() {
         Spi::run(
             "CREATE TABLE lite_normalization (id int, body text);
