@@ -26,7 +26,7 @@ use pgrx::{
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_void};
-use tinql::runtime::{Query, SpanTermSlot, parse_tinql_to_query};
+use tinql::runtime::{Query, SpanTermSlot, evaluate, parse_tinql_to_query, tokenize_doc};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,7 +220,12 @@ fn build_corpus(
                 scorer.score_count(tf, tokens.len() as u32)
             }
         }));
-        max = max.max(score);
+        let matched = evaluate(&query, &tokenize_doc(&document, &tokenizer))
+            .unwrap_or_else(|error| pgrx::error!("tin score query evaluation failed: {error}"))
+            .matched;
+        if matched {
+            max = max.max(score);
+        }
         by_document.insert(document, score);
     }
     ScoreCorpus {
