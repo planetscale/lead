@@ -433,9 +433,18 @@ struct QualBinding {
     matches: Vec<(*mut pg_sys::Node, *mut pg_sys::Node)>,
 }
 
+/// Search expressions under a `NOT` exclude rows rather than describe them, so
+/// they contribute neither scoring terms nor highlight marks.
+pub(crate) fn is_negation(node: *mut pg_sys::Node) -> bool {
+    unsafe {
+        (*node).type_ == pg_sys::NodeTag::T_BoolExpr
+            && (*node.cast::<pg_sys::BoolExpr>()).boolop == pg_sys::BoolExprType::NOT_EXPR
+    }
+}
+
 #[pg_guard]
 unsafe extern "C-unwind" fn find_qual(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
-    if node.is_null() || unsafe { (*node).type_ } == pg_sys::NodeTag::T_Query {
+    if node.is_null() || unsafe { (*node).type_ } == pg_sys::NodeTag::T_Query || is_negation(node) {
         return false;
     }
     let binding = unsafe { &mut *context.cast::<QualBinding>() };
@@ -456,11 +465,53 @@ unsafe extern "C-unwind" fn find_qual(node: *mut pg_sys::Node, context: *mut c_v
     unsafe { pg_sys::expression_tree_walker(node, Some(find_qual), context) }
 }
 
+struct VarnoBinding {
+    varno: i32,
+    seen: bool,
+    valid: bool,
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn collect_varno(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    let binding = unsafe { &mut *context.cast::<VarnoBinding>() };
+    if unsafe { (*node).type_ } == pg_sys::NodeTag::T_Var {
+        let var = unsafe { &*node.cast::<pg_sys::Var>() };
+        if var.varlevelsup != 0 || (binding.seen && binding.varno != var.varno) {
+            binding.valid = false;
+        } else {
+            binding.varno = var.varno;
+            binding.seen = true;
+        }
+        return false;
+    }
+    unsafe { pg_sys::expression_tree_walker(node, Some(collect_varno), context) }
+}
+
+/// Returns the range table entry that every `Var` in `node` belongs to, or
+/// `None` when the node spans several entries, an outer query level, or none.
+pub(crate) unsafe fn single_varno(node: *mut pg_sys::Node) -> Option<i32> {
+    let mut binding = VarnoBinding {
+        varno: 0,
+        seen: false,
+        valid: true,
+    };
+    unsafe { collect_varno(node, (&raw mut binding).cast()) };
+    (binding.valid && binding.seen).then_some(binding.varno)
+}
+
 pub(crate) unsafe fn find_matching_tin_index(
     heap_oid: pg_sys::Oid,
     query_varno: i32,
     operand: *mut pg_sys::Node,
 ) -> Option<pg_sys::Oid> {
+    // The operand is normalized to varno 1 below to compare it against stored
+    // index expressions, so quals on other relations have to be rejected here.
+    if unsafe { single_varno(operand) } != Some(query_varno) {
+        return None;
+    }
     let tin_name = CString::new("tin").expect("static access method name is valid");
     let tin_am = unsafe { pg_sys::get_index_am_oid(tin_name.as_ptr(), false) };
     let normalized = unsafe { pg_sys::copyObjectImpl(operand.cast()).cast::<pg_sys::Node>() };
