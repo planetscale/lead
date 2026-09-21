@@ -20,8 +20,7 @@ use crate::bm25::{
 };
 use pgrx::iter::TableIterator;
 use pgrx::{
-    FromDatum, Internal, IntoDatum, PgList, PgRelation, Spi, default, name, pg_extern, pg_guard,
-    pg_sys,
+    Internal, IntoDatum, PgBox, PgList, PgRelation, Spi, default, name, pg_extern, pg_guard, pg_sys,
 };
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
@@ -104,7 +103,7 @@ fn bits(value: Option<f32>) -> Option<u32> {
 )]
 fn score_bound(
     document: &str,
-    query: &str,
+    query: Vec<Option<String>>,
     heap_oid: i32,
     index_oid: i32,
     mode: i32,
@@ -114,12 +113,19 @@ fn score_bound(
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
 ) -> f32 {
+    let mut parts = Vec::with_capacity(query.len());
+    for part in query {
+        // A NULL search expression matches no rows, so nothing needs a score.
+        let Some(part) = part else { return 0.0 };
+        parts.push(format!("({part})"));
+    }
+    let query = parts.join(" OR ");
     let key = CacheKey {
         transaction: unsafe { pg_sys::GetTopTransactionIdIfAny().into_inner() },
         command: unsafe { pg_sys::GetCurrentCommandId(false) },
         heap_oid: heap_oid as u32,
         index_oid: index_oid as u32,
-        query: query.to_owned(),
+        query,
         full: mode == 1 || mode == 3,
         dense: dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits(),
         k1: bits(k1),
@@ -429,7 +435,7 @@ struct QualBinding {
 
 #[pg_guard]
 unsafe extern "C-unwind" fn find_qual(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
-    if node.is_null() {
+    if node.is_null() || unsafe { (*node).type_ } == pg_sys::NodeTag::T_Query {
         return false;
     }
     let binding = unsafe { &mut *context.cast::<QualBinding>() };
@@ -580,8 +586,10 @@ fn score_support(request: Internal) -> Internal {
         let mut binding = QualBinding {
             matches: Vec::new(),
         };
-        let quals = (*(*parse).jointree).quals.cast::<pg_sys::Node>();
-        find_qual(quals, (&mut binding as *mut QualBinding).cast());
+        // Pulled-up subqueries leave their quals in nested FromExpr nodes, so
+        // walk the whole jointree rather than only its top-level quals.
+        let jointree = (*parse).jointree.cast::<pg_sys::Node>();
+        find_qual(jointree, (&mut binding as *mut QualBinding).cast());
         let rte = pg_sys::list_nth((*parse).rtable, (ctid.varno - 1) as i32)
             .cast::<pg_sys::RangeTblEntry>();
         if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
@@ -625,9 +633,7 @@ fn score_support(request: Internal) -> Internal {
             .copied()
             .filter(|(candidate, _)| pg_sys::equal((*candidate).cast(), document.cast()))
             .collect::<Vec<_>>();
-        let combined_query = combine_constant_queries(&same_expression)
-            .unwrap_or_else(|| pg_sys::copyObjectImpl(first_query.cast()).cast());
-        args.push(combined_query);
+        args.push(make_query_array(&same_expression, first_query));
         args.push(make_int4_const((*rte).relid.to_u32() as i32).cast());
         args.push(make_int4_const(index_oid.to_u32() as i32).cast());
         args.push(make_int4_const(mode).cast());
@@ -673,41 +679,31 @@ fn score_support(request: Internal) -> Internal {
     }
 }
 
-unsafe fn combine_constant_queries(
+/// Builds the `text[]` of search expressions that the scorer combines. Passing
+/// the expressions as an array keeps parameters and other non-constant nodes,
+/// which cannot be combined at plan time, contributing to the scores.
+unsafe fn make_query_array(
     matches: &[(*mut pg_sys::Node, *mut pg_sys::Node)],
-) -> Option<*mut pg_sys::Node> {
-    if matches.len() < 2 {
-        return None;
-    }
-    let mut queries = Vec::with_capacity(matches.len());
+    first_query: *mut pg_sys::Node,
+) -> *mut pg_sys::Node {
+    let mut elements = PgList::<pg_sys::Node>::new();
     for &(_, node) in matches {
-        if node.is_null() || unsafe { (*node).type_ } != pg_sys::NodeTag::T_Const {
-            return None;
+        if node.is_null() || unsafe { pg_sys::exprType(node) } != pg_sys::TEXTOID {
+            continue;
         }
-        let value = unsafe { &*node.cast::<pg_sys::Const>() };
-        if value.constisnull || value.consttype != pg_sys::TEXTOID {
-            return None;
-        }
-        queries.push(unsafe { String::from_datum(value.constvalue, false)? });
+        elements.push(unsafe { pg_sys::copyObjectImpl(node.cast()).cast() });
     }
-    let combined = queries
-        .into_iter()
-        .map(|query| format!("({query})"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let datum = combined.into_datum()?;
-    Some(unsafe {
-        pg_sys::makeConst(
-            pg_sys::TEXTOID,
-            -1,
-            pg_sys::DEFAULT_COLLATION_OID,
-            -1,
-            datum,
-            false,
-            false,
-        )
-        .cast()
-    })
+    if elements.is_empty() {
+        elements.push(unsafe { pg_sys::copyObjectImpl(first_query.cast()).cast() });
+    }
+    let mut array = unsafe { PgBox::<pg_sys::ArrayExpr>::alloc_node(pg_sys::NodeTag::T_ArrayExpr) };
+    array.array_typeid = pg_sys::TEXTARRAYOID;
+    array.array_collid = pg_sys::DEFAULT_COLLATION_OID;
+    array.element_typeid = pg_sys::TEXTOID;
+    array.elements = elements.into_pg();
+    array.multidims = false;
+    array.location = -1;
+    array.into_pg().cast()
 }
 
 unsafe fn make_int4_const(value: i32) -> *mut pg_sys::Const {
@@ -743,7 +739,7 @@ unsafe fn lookup_score_bound() -> pg_sys::Oid {
     let names = unsafe { pg_sys::stringToQualifiedNameList(name.as_ptr(), std::ptr::null_mut()) };
     let types = [
         pg_sys::TEXTOID,
-        pg_sys::TEXTOID,
+        pg_sys::TEXTARRAYOID,
         pg_sys::INT4OID,
         pg_sys::INT4OID,
         pg_sys::INT4OID,
@@ -762,7 +758,7 @@ ALTER FUNCTION @extschema@.full_score(pg_catalog.tid) SUPPORT @extschema@.score_
 ALTER FUNCTION @extschema@.full_score(pg_catalog.tid, pg_catalog.float4, pg_catalog.float4) SUPPORT @extschema@.score_support;
 ALTER FUNCTION @extschema@.score(pg_catalog.tid, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) SUPPORT @extschema@.score_support;
 ALTER FUNCTION @extschema@.max_score(pg_catalog.tid) SUPPORT @extschema@.score_support;
-REVOKE ALL ON FUNCTION @extschema@.score_bound(pg_catalog.text, pg_catalog.text, pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION @extschema@.score_bound(pg_catalog.text, pg_catalog.text[], pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
 "#,
     name = "score_support_bindings",
     requires = [

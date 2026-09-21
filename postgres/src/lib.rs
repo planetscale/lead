@@ -267,6 +267,52 @@ mod tests {
     }
 
     #[pg_test]
+    fn parameterized_queries_score_like_literals() {
+        Spi::run(
+            "CREATE TABLE lite_param_score (id int PRIMARY KEY, title text);
+             INSERT INTO lite_param_score VALUES (1, 'lorem ipsum'), (2, 'lorem ipsun');
+             CREATE INDEX ON lite_param_score USING tin (title);
+             PREPARE lite_ranked(text, text) AS
+               SELECT tin.score(ctid) FROM lite_param_score
+               WHERE title ==> $1 AND title ==> $2 ORDER BY id",
+        )
+        .unwrap();
+        let literal = Spi::get_one::<f32>(
+            "SELECT tin.score(ctid) FROM lite_param_score
+             WHERE title ==> 'lorem^4'
+               AND title ==> '(ipsum^4 OR ipsum~1^1.4 OR ipsum*^2)'
+             ORDER BY id",
+        )
+        .unwrap();
+        let prepared = Spi::get_one::<f32>(
+            "EXECUTE lite_ranked('lorem^4', '(ipsum^4 OR ipsum~1^1.4 OR ipsum*^2)')",
+        )
+        .unwrap();
+        assert_eq!(prepared, literal);
+    }
+
+    #[pg_test]
+    fn score_survives_subquery_aggregate() {
+        Spi::run(
+            "CREATE TABLE lite_sub_score (id int PRIMARY KEY, title text);
+             INSERT INTO lite_sub_score VALUES (1, 'lorem ipsum'), (2, 'lorem ipsun');
+             CREATE INDEX ON lite_sub_score USING tin (title);",
+        )
+        .unwrap();
+        let direct = Spi::get_one::<f32>(
+            "SELECT max(tin.score(ctid)) FROM lite_sub_score WHERE title ==> 'lorem^4'",
+        )
+        .unwrap();
+        let nested = Spi::get_one::<f32>(
+            "SELECT max(score) FROM (
+               SELECT tin.score(ctid) AS score FROM lite_sub_score WHERE title ==> 'lorem^4'
+             ) AS matches",
+        )
+        .unwrap();
+        assert_eq!(nested, direct);
+    }
+
+    #[pg_test]
     fn max_score_excludes_nonmatching_documents() {
         for (name, matching, nonmatching, query) in [
             (
