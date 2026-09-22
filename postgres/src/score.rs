@@ -800,7 +800,19 @@ unsafe fn lookup_score_bound() -> pg_sys::Oid {
         pg_sys::TEXTARRAYOID,
         pg_sys::TEXTARRAYOID,
     ];
-    unsafe { pg_sys::LookupFuncName(names, types.len() as i32, types.as_ptr(), false) }
+    let oid = unsafe { pg_sys::LookupFuncName(names, types.len() as i32, types.as_ptr(), true) };
+    if oid == pg_sys::InvalidOid {
+        pgrx::ereport!(
+            ERROR,
+            pg_sys::errcodes::PgSqlErrorCode::ERRCODE_UNDEFINED_FUNCTION,
+            "tin.score_bound() is missing: the installed tin SQL predates this build",
+            "Lead ships no extension upgrade scripts, so the extension has to be \
+             reinstalled: DROP EXTENSION tin CASCADE; CREATE EXTENSION tin; \
+             CASCADE also drops every tin index and anything else that depends on \
+             them, so recreate those afterwards."
+        );
+    }
+    oid
 }
 
 pgrx::extension_sql!(

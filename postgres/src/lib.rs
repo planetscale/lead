@@ -312,6 +312,18 @@ mod tests {
         assert_eq!(nested, direct);
     }
 
+    #[pg_test(error = "tin.score_bound() is missing: the installed tin SQL predates this build")]
+    fn scoring_reports_an_outdated_installed_extension() {
+        Spi::run(
+            "CREATE TABLE lite_stale (title text);
+             CREATE INDEX ON lite_stale USING tin (title);
+             ALTER FUNCTION tin.score_bound(text, text[], int4, int4, int4,
+               float4, float4, float4, text[], text[]) RENAME TO score_bound_stale;",
+        )
+        .unwrap();
+        Spi::run("SELECT tin.score(ctid) FROM lite_stale WHERE title ==> 'lorem'").unwrap();
+    }
+
     #[pg_test]
     fn quals_on_other_relations_do_not_bind_to_the_scored_relation() {
         Spi::run(
