@@ -267,6 +267,116 @@ mod tests {
     }
 
     #[pg_test]
+    fn parameterized_queries_score_like_literals() {
+        Spi::run(
+            "CREATE TABLE lite_param_score (id int PRIMARY KEY, title text);
+             INSERT INTO lite_param_score VALUES (1, 'lorem ipsum'), (2, 'lorem ipsun');
+             CREATE INDEX ON lite_param_score USING tin (title);
+             PREPARE lite_ranked(text, text) AS
+               SELECT tin.score(ctid) FROM lite_param_score
+               WHERE title ==> $1 AND title ==> $2 ORDER BY id",
+        )
+        .unwrap();
+        let literal = Spi::get_one::<f32>(
+            "SELECT tin.score(ctid) FROM lite_param_score
+             WHERE title ==> 'lorem^4'
+               AND title ==> '(ipsum^4 OR ipsum~1^1.4 OR ipsum*^2)'
+             ORDER BY id",
+        )
+        .unwrap();
+        let prepared = Spi::get_one::<f32>(
+            "EXECUTE lite_ranked('lorem^4', '(ipsum^4 OR ipsum~1^1.4 OR ipsum*^2)')",
+        )
+        .unwrap();
+        assert_eq!(prepared, literal);
+    }
+
+    #[pg_test]
+    fn score_survives_subquery_aggregate() {
+        Spi::run(
+            "CREATE TABLE lite_sub_score (id int PRIMARY KEY, title text);
+             INSERT INTO lite_sub_score VALUES (1, 'lorem ipsum'), (2, 'lorem ipsun');
+             CREATE INDEX ON lite_sub_score USING tin (title);",
+        )
+        .unwrap();
+        let direct = Spi::get_one::<f32>(
+            "SELECT max(tin.score(ctid)) FROM lite_sub_score WHERE title ==> 'lorem^4'",
+        )
+        .unwrap();
+        let nested = Spi::get_one::<f32>(
+            "SELECT max(score) FROM (
+               SELECT tin.score(ctid) AS score FROM lite_sub_score WHERE title ==> 'lorem^4'
+             ) AS matches",
+        )
+        .unwrap();
+        assert_eq!(nested, direct);
+    }
+
+    #[pg_test(error = "tin.score_bound() is missing: the installed tin SQL predates this build")]
+    fn scoring_reports_an_outdated_installed_extension() {
+        Spi::run(
+            "CREATE TABLE lite_stale (title text);
+             CREATE INDEX ON lite_stale USING tin (title);
+             ALTER FUNCTION tin.score_bound(text, text[], int4, int4, int4,
+               float4, float4, float4, text[], text[]) RENAME TO score_bound_stale;",
+        )
+        .unwrap();
+        Spi::run("SELECT tin.score(ctid) FROM lite_stale WHERE title ==> 'lorem'").unwrap();
+    }
+
+    #[pg_test]
+    fn quals_on_other_relations_do_not_bind_to_the_scored_relation() {
+        Spi::run(
+            "CREATE TABLE lite_cross_a (id int, title text);
+             INSERT INTO lite_cross_a SELECT g, 'filler word number ' || g
+               FROM generate_series(1, 30) g;
+             UPDATE lite_cross_a SET title = 'alpha zeta filler' WHERE id = 1;
+             CREATE INDEX ON lite_cross_a USING tin (title);
+             CREATE TABLE lite_cross_b (id int, title text);
+             INSERT INTO lite_cross_b SELECT g, 'padding text number ' || g
+               FROM generate_series(1, 30) g;
+             UPDATE lite_cross_b SET title = 'kappa padding' WHERE id = 1;
+             CREATE INDEX ON lite_cross_b USING tin (title);",
+        )
+        .unwrap();
+        let alone = Spi::get_one::<f32>(
+            "SELECT tin.score(b.ctid) FROM lite_cross_b b WHERE b.title ==> 'kappa'",
+        )
+        .unwrap();
+        assert!(alone.is_some_and(|score| score > 0.0), "{alone:?}");
+        let joined = Spi::get_one::<f32>(
+            "SELECT tin.score(b.ctid) FROM lite_cross_a a, lite_cross_b b
+             WHERE a.title ==> 'zeta' AND b.title ==> 'kappa'",
+        )
+        .unwrap();
+        assert_eq!(joined, alone);
+    }
+
+    #[pg_test]
+    fn negated_quals_do_not_contribute_to_scores() {
+        Spi::run(
+            "CREATE TABLE lite_negated (id int, title text);
+             INSERT INTO lite_negated SELECT g, 'filler word number ' || g
+               FROM generate_series(1, 30) g;
+             UPDATE lite_negated SET title = 'alpha zeta filler' WHERE id = 1;
+             UPDATE lite_negated SET title = 'alpha omega omega omega' WHERE id = 2;
+             CREATE INDEX ON lite_negated USING tin (title);",
+        )
+        .unwrap();
+        let baseline = Spi::get_two::<f32, f32>(
+            "SELECT tin.max_score(ctid), tin.score(ctid) FROM lite_negated
+             WHERE title ==> 'zeta'",
+        )
+        .unwrap();
+        let negated = Spi::get_two::<f32, f32>(
+            "SELECT tin.max_score(ctid), tin.score(ctid) FROM lite_negated
+             WHERE title ==> 'zeta' AND NOT (title ==> 'omega')",
+        )
+        .unwrap();
+        assert_eq!(negated, baseline);
+    }
+
+    #[pg_test]
     fn max_score_excludes_nonmatching_documents() {
         for (name, matching, nonmatching, query) in [
             (
