@@ -19,6 +19,7 @@ use pgrx::pg_guard;
 ::pgrx::pg_module_magic!(name);
 
 mod am;
+mod analysis;
 mod bm25;
 mod highlight;
 mod highlight_udfs;
@@ -1169,6 +1170,131 @@ mod tests {
         .unwrap();
         assert!(ansi.contains("\x1b["));
         assert!(ansi.contains("Beer"));
+    }
+
+    #[pg_test]
+    fn stemmed_index_matches_inflected_words_everywhere() {
+        Spi::run(
+            "CREATE TABLE lite_stem (id int, body text);
+             INSERT INTO lite_stem VALUES
+               (1, 'molded'), (2, 'MOLDS'), (3, 'moldy'), (4, 'wine');
+             CREATE INDEX lite_stem_idx ON lite_stem USING tin (body)
+               WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        for setting in ["on", "off"] {
+            Spi::run(&format!("SET LOCAL enable_seqscan = {setting}")).unwrap();
+            assert_eq!(
+                Spi::get_one::<Vec<i32>>(
+                    "SELECT array_agg(id ORDER BY id) FROM lite_stem WHERE body ==> 'mold'"
+                )
+                .unwrap(),
+                Some(vec![1, 2]),
+                "enable_seqscan = {setting}"
+            );
+        }
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT count(*) FROM lite_stem a JOIN lite_stem b ON a.id = b.id
+                 WHERE b.body ==> 'molding'"
+            )
+            .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[pg_test]
+    fn cached_plans_follow_the_index_stemmer() {
+        Spi::run(
+            "CREATE TABLE lite_stem_cached (id int, body text);
+             INSERT INTO lite_stem_cached VALUES (1, 'molded'), (2, 'mold');
+             CREATE INDEX lite_stem_cached_idx ON lite_stem_cached USING tin (body)
+               WITH (stemmer = 'en');
+             SET LOCAL plan_cache_mode = force_generic_plan;
+             PREPARE lite_stem_query(text) AS
+               SELECT array_agg(id ORDER BY id) FROM lite_stem_cached WHERE body ==> $1;",
+        )
+        .unwrap();
+        let run = || {
+            Spi::get_one::<Vec<i32>>("EXECUTE lite_stem_query('molds')")
+                .unwrap()
+                .unwrap_or_default()
+        };
+        assert_eq!(run(), vec![1, 2]);
+        Spi::run(
+            "ALTER INDEX lite_stem_cached_idx RESET (stemmer);
+             REINDEX INDEX lite_stem_cached_idx;",
+        )
+        .unwrap();
+        assert!(run().is_empty());
+    }
+
+    #[pg_test(error = "unknown stemmer language code: bogus")]
+    fn unknown_stemmer_languages_are_rejected() {
+        Spi::run(
+            "CREATE TABLE lite_stem_unknown (body text);
+             CREATE INDEX ON lite_stem_unknown USING tin (body) WITH (stemmer = 'bogus');",
+        )
+        .unwrap();
+    }
+
+    #[pg_test(error = "stemming requires case_folding = fold")]
+    fn stemming_requires_case_folding() {
+        Spi::run(
+            "CREATE TABLE lite_stem_case (body text);
+             CREATE INDEX ON lite_stem_case USING tin (body)
+               WITH (case_folding = preserve);
+             ALTER INDEX lite_stem_case_body_idx SET (stemmer = 'en');",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn highlights_bind_the_index_analysis() {
+        Spi::run(
+            "CREATE TABLE lite_stem_highlight (body text);
+             INSERT INTO lite_stem_highlight VALUES ('Running and RUNS');
+             CREATE INDEX ON lite_stem_highlight USING tin (body) WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        for call in [
+            "tin.highlight(body)",
+            "tin.highlight(body, query => 'runs')",
+            "tin.highlight_v1_0_3(body, query => 'running')",
+            "tin.highlight(body, stemmer => 'en')",
+        ] {
+            assert_eq!(
+                Spi::get_one::<String>(&format!(
+                    "SELECT {call} FROM lite_stem_highlight WHERE body ==> 'run'"
+                ))
+                .unwrap(),
+                Some("<b>Running</b> and <b>RUNS</b>".into()),
+                "{call}"
+            );
+        }
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT tin.highlight('Running and RUNS', query => 'runs', stemmer => 'en')"
+            )
+            .unwrap(),
+            Some("<b>Running</b> and <b>RUNS</b>".into())
+        );
+    }
+
+    #[pg_test(
+        error = "tin.highlight() analysis conflicts with the searched index; matching columns, including UNION ALL and partition children, must use the same analysis options"
+    )]
+    fn highlights_reject_analysis_that_conflicts_with_the_index() {
+        Spi::run(
+            "CREATE TABLE lite_stem_conflict (body text);
+             CREATE INDEX ON lite_stem_conflict USING tin (body) WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT tin.highlight(body, stemmer => 'fr')
+             FROM lite_stem_conflict WHERE body ==> 'runs'",
+        )
+        .unwrap();
     }
 }
 

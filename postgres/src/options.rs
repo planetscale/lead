@@ -101,6 +101,8 @@ struct IndexOptions {
     k1: f64,
     b: f64,
     score_stop_words: i32,
+    /// String offset; zero disables stemming.
+    stemmer: i32,
 }
 
 pub fn init() {
@@ -208,6 +210,15 @@ pub fn init() {
             None,
             lock,
         );
+        pg_sys::add_string_reloption(
+            kind,
+            c"stemmer".as_ptr(),
+            c"Snowball stemmer language code (unset disables stemming; changes require REINDEX)"
+                .as_ptr(),
+            std::ptr::null(),
+            None,
+            lock,
+        );
         OPTION_KIND.store(kind, Ordering::Relaxed);
     }
 }
@@ -287,8 +298,13 @@ pub unsafe extern "C-unwind" fn amoptions(
             pg_sys::relopt_type::RELOPT_TYPE_STRING,
             std::mem::offset_of!(IndexOptions, score_stop_words),
         ),
+        parse_entry(
+            c"stemmer".as_ptr(),
+            pg_sys::relopt_type::RELOPT_TYPE_STRING,
+            std::mem::offset_of!(IndexOptions, stemmer),
+        ),
     ];
-    unsafe {
+    let packed = unsafe {
         pg_sys::build_reloptions(
             reloptions,
             validate,
@@ -297,8 +313,16 @@ pub unsafe extern "C-unwind" fn amoptions(
             entries.as_ptr(),
             entries.len() as i32,
         )
-        .cast()
+        .cast::<IndexOptions>()
+    };
+    if validate {
+        // ALTER SET/RESET supplies the merged options, so the stemmer and
+        // case folding are checked together even when only one changed.
+        spec_from(unsafe { packed.as_ref() })
+            .validate()
+            .unwrap_or_else(|error| pgrx::error!("{error}"));
     }
+    packed.cast()
 }
 
 unsafe fn parsed(index: pg_sys::Relation) -> Option<&'static IndexOptions> {
@@ -309,7 +333,11 @@ unsafe fn parsed(index: pg_sys::Relation) -> Option<&'static IndexOptions> {
 }
 
 pub unsafe fn tokenizer_spec(index: pg_sys::Relation) -> TokenizerPipelineSpec {
-    let Some(options) = (unsafe { parsed(index) }) else {
+    spec_from(unsafe { parsed(index) })
+}
+
+fn spec_from(options: Option<&IndexOptions>) -> TokenizerPipelineSpec {
+    let Some(options) = options else {
         return TokenizerPipelineSpec::tin_default();
     };
     TokenizerPipelineSpec {
@@ -336,7 +364,22 @@ pub unsafe fn tokenizer_spec(index: pg_sys::Relation) -> TokenizerPipelineSpec {
             GAPS_COLLAPSE => PositionGapMode::Collapse,
             _ => PositionGapMode::Preserve,
         },
+        stemmer: stemmer(options),
     }
+}
+
+fn stemmer(options: &IndexOptions) -> Option<tokenizer::Stemmer> {
+    let offset = usize::try_from(options.stemmer).ok().filter(|&n| n != 0)?;
+    let ptr = std::ptr::from_ref(options).cast::<u8>();
+    // build_reloptions owns the trailing, NUL-terminated string.
+    let language = unsafe { CStr::from_ptr(ptr.add(offset).cast()) }
+        .to_str()
+        .expect("stemmer reloption must be valid UTF-8");
+    Some(
+        language
+            .parse()
+            .unwrap_or_else(|error| pgrx::error!("{error}")),
+    )
 }
 
 fn decode_folding(value: i32) -> Folding {

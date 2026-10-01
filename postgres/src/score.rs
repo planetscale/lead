@@ -226,7 +226,7 @@ fn score_bound(
             .take()
             .zip(search)
             .map(|(mut queries, search)| {
-                queries.push(search);
+                queries.push(crate::analysis::raw_query(&search).to_owned());
                 queries
             });
     }
@@ -780,7 +780,11 @@ unsafe fn restriction_clauses(parse: *mut pg_sys::Query, varno: i32) -> *mut pg_
             if qual.is_null() {
                 continue;
             }
-            let qual = pg_sys::copyObjectImpl(qual.cast()).cast::<pg_sys::Node>();
+            let mut qual = pg_sys::copyObjectImpl(qual.cast()).cast::<pg_sys::Node>();
+            // Quals the planner already preprocessed are implicit-AND lists.
+            if (*qual).type_ == pg_sys::NodeTag::T_List {
+                qual = pg_sys::make_ands_explicit(qual.cast()).cast();
+            }
             let qual = pg_sys::remove_nulling_relids(qual, every_relation, std::ptr::null());
             // Without a planner root, support functions decline to rewrite,
             // so this cannot reenter scoring support.
@@ -792,11 +796,36 @@ unsafe fn restriction_clauses(parse: *mut pg_sys::Query, varno: i32) -> *mut pg_
     }
 }
 
+#[pg_guard]
+unsafe extern "C-unwind" fn clear_nulling(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if unsafe { (*node).type_ } == pg_sys::NodeTag::T_Var {
+        unsafe { (*node.cast::<pg_sys::Var>()).varnullingrels = std::ptr::null_mut() };
+        return false;
+    }
+    unsafe { pg_sys::expression_tree_walker(node, Some(clear_nulling), context) }
+}
+
+/// Compares two operands while ignoring outer-join nulling metadata, which
+/// differs between a join's own clauses and expressions above the join.
+pub(crate) unsafe fn same_operand(left: *mut pg_sys::Node, right: *mut pg_sys::Node) -> bool {
+    unsafe {
+        let left = pg_sys::copyObjectImpl(left.cast()).cast::<pg_sys::Node>();
+        let right = pg_sys::copyObjectImpl(right.cast()).cast::<pg_sys::Node>();
+        clear_nulling(left, std::ptr::null_mut());
+        clear_nulling(right, std::ptr::null_mut());
+        pg_sys::equal(left.cast(), right.cast())
+    }
+}
+
 /// Returns the tin index that scoring and highlighting bind `operand` to, the
 /// way tin selects one: a partial index qualifies only when the query's quals
 /// on the relation imply its predicate. Lead's indexes store no pages, so of
 /// the qualifying indexes the newest partial one wins, then the newest full
-/// one.
+/// one. With a null `parse`, only full indexes qualify: the query's quals are
+/// expressed in the columns of another relation.
 pub(crate) unsafe fn find_matching_tin_index(
     parse: *mut pg_sys::Query,
     heap_oid: pg_sys::Oid,
@@ -812,6 +841,8 @@ pub(crate) unsafe fn find_matching_tin_index(
     let tin_am = unsafe { pg_sys::get_index_am_oid(tin_name.as_ptr(), false) };
     let normalized = unsafe { pg_sys::copyObjectImpl(operand.cast()).cast::<pg_sys::Node>() };
     unsafe { pg_sys::ChangeVarNodes(normalized, query_varno, 1, 0) };
+    // Outer-join nulling metadata does not change which index covers a column.
+    unsafe { clear_nulling(normalized, std::ptr::null_mut()) };
     let normalized = unsafe { pg_sys::strip_implicit_coercions(normalized) };
     let heap = unsafe { pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as _) };
     let indexes = unsafe { PgList::<pg_sys::Oid>::from_pg(pg_sys::RelationGetIndexList(heap)) };
@@ -854,12 +885,13 @@ pub(crate) unsafe fn find_matching_tin_index(
         let partial = !predicate.is_null();
         let eligible = matches
             && (!partial
-                || unsafe {
-                    pg_sys::ChangeVarNodes(predicate.cast(), 1, query_varno, 0);
-                    let clauses =
-                        *clauses.get_or_insert_with(|| restriction_clauses(parse, query_varno));
-                    pg_sys::predicate_implied_by(predicate, clauses, false)
-                });
+                || !parse.is_null()
+                    && unsafe {
+                        pg_sys::ChangeVarNodes(predicate.cast(), 1, query_varno, 0);
+                        let clauses =
+                            *clauses.get_or_insert_with(|| restriction_clauses(parse, query_varno));
+                        pg_sys::predicate_implied_by(predicate, clauses, false)
+                    });
         unsafe { pg_sys::index_close(index, pg_sys::AccessShareLock as _) };
         let choice = (partial, index_oid.to_u32());
         if eligible && matched.is_none_or(|best| choice > best) {
@@ -1433,7 +1465,7 @@ pub(crate) unsafe fn make_text_array(elements: PgList<pg_sys::Node>) -> *mut pg_
     array.into_pg().cast()
 }
 
-unsafe fn make_int4_const(value: i32) -> *mut pg_sys::Const {
+pub(crate) unsafe fn make_int4_const(value: i32) -> *mut pg_sys::Const {
     unsafe {
         pg_sys::makeConst(
             pg_sys::INT4OID,
@@ -1447,7 +1479,7 @@ unsafe fn make_int4_const(value: i32) -> *mut pg_sys::Const {
     }
 }
 
-unsafe fn make_null_const(type_oid: pg_sys::Oid) -> *mut pg_sys::Const {
+pub(crate) unsafe fn make_null_const(type_oid: pg_sys::Oid) -> *mut pg_sys::Const {
     unsafe {
         pg_sys::makeConst(
             type_oid,

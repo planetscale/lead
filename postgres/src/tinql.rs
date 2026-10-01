@@ -74,8 +74,3 @@ pub(crate) fn parse_tinql_to_query<T: Tokenizer>(
 ) -> Result<Query, QueryError> {
     Ok(lower(&sub_tokenize(parse(query)?, tokenizer)?)?)
 }
-
-/// [`parse_tinql_to_query`] with the extension's default tokenization pipeline.
-pub(crate) fn parse_tinql_to_query_default(query: &str) -> Result<Query, QueryError> {
-    parse_tinql_to_query(query, tokenizer::presets::default_pipeline())
-}
