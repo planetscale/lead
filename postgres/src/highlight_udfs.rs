@@ -77,37 +77,6 @@ fn highlight_ansi(
     render_highlight_ansi(text, wrap_to, query)
 }
 
-struct VarContext {
-    varno: i32,
-    seen: bool,
-    valid: bool,
-}
-
-#[pg_guard]
-unsafe extern "C-unwind" fn collect_varno(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
-    if node.is_null() {
-        return false;
-    }
-    let context = unsafe { &mut *context.cast::<VarContext>() };
-    if unsafe { (*node).type_ } == pg_sys::NodeTag::T_Var {
-        let var = unsafe { &*node.cast::<pg_sys::Var>() };
-        if var.varlevelsup != 0 || (context.seen && context.varno != var.varno) {
-            context.valid = false;
-        } else {
-            context.varno = var.varno;
-            context.seen = true;
-        }
-        return false;
-    }
-    unsafe {
-        pg_sys::expression_tree_walker(
-            node,
-            Some(collect_varno),
-            (context as *mut VarContext).cast(),
-        )
-    }
-}
-
 struct QueryContext {
     document: *mut pg_sys::Node,
     queries: Vec<*mut pg_sys::Node>,
@@ -115,7 +84,10 @@ struct QueryContext {
 
 #[pg_guard]
 unsafe extern "C-unwind" fn collect_queries(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
-    if node.is_null() {
+    if node.is_null()
+        || unsafe { (*node).type_ } == pg_sys::NodeTag::T_Query
+        || crate::score::is_negation(node)
+    {
         return false;
     }
     let context = unsafe { &mut *context.cast::<QueryContext>() };
@@ -147,28 +119,8 @@ fn unhandled() -> Internal {
     Internal::from(Some(pg_sys::Datum::from(0_usize)))
 }
 
-unsafe fn combined_query(queries: &[*mut pg_sys::Node]) -> *mut pg_sys::Node {
-    if queries.len() < 2 {
-        return unsafe { pg_sys::copyObjectImpl(queries[0].cast()).cast() };
-    }
-    let mut text = Vec::with_capacity(queries.len());
-    for &query in queries {
-        if query.is_null() || unsafe { (*query).type_ } != pg_sys::NodeTag::T_Const {
-            return unsafe { pg_sys::copyObjectImpl(queries[0].cast()).cast() };
-        }
-        let value = unsafe { &*query.cast::<pg_sys::Const>() };
-        if value.constisnull || value.consttype != pg_sys::TEXTOID {
-            return unsafe { pg_sys::copyObjectImpl(queries[0].cast()).cast() };
-        }
-        let Some(value) = (unsafe { String::from_datum(value.constvalue, false) }) else {
-            return unsafe { pg_sys::copyObjectImpl(queries[0].cast()).cast() };
-        };
-        text.push(format!("({value})"));
-    }
-    let datum = text
-        .join(" OR ")
-        .into_datum()
-        .expect("String is never NULL");
+unsafe fn text_const(value: &str) -> *mut pg_sys::Node {
+    let datum = value.into_datum().expect("&str is never NULL");
     unsafe {
         pg_sys::makeConst(
             pg_sys::TEXTOID,
@@ -181,6 +133,59 @@ unsafe fn combined_query(queries: &[*mut pg_sys::Node]) -> *mut pg_sys::Node {
         )
         .cast()
     }
+}
+
+unsafe fn concatenate(left: *mut pg_sys::Node, right: *mut pg_sys::Node) -> *mut pg_sys::Node {
+    let mut args = PgList::<pg_sys::Node>::new();
+    args.push(left);
+    args.push(right);
+    unsafe {
+        pg_sys::makeFuncExpr(
+            pg_sys::Oid::from(pg_sys::F_TEXTCAT),
+            pg_sys::TEXTOID,
+            args.into_pg(),
+            pg_sys::DEFAULT_COLLATION_OID,
+            pg_sys::DEFAULT_COLLATION_OID,
+            pg_sys::CoercionForm::COERCE_EXPLICIT_CALL,
+        )
+        .cast()
+    }
+}
+
+/// Combines the search expressions of every binding qual into one query.
+/// Constant expressions fold at plan time; parameters and other run-time
+/// expressions are concatenated by the plan instead of being dropped.
+unsafe fn combined_query(queries: &[*mut pg_sys::Node]) -> *mut pg_sys::Node {
+    if queries.len() < 2 {
+        return unsafe { pg_sys::copyObjectImpl(queries[0].cast()).cast() };
+    }
+    if let Some(text) = unsafe { constant_texts(queries) } {
+        return unsafe { text_const(&text.join(" OR ")) };
+    }
+    let mut combined = unsafe { text_const("(") };
+    for (position, &query) in queries.iter().enumerate() {
+        if position > 0 {
+            combined = unsafe { concatenate(combined, text_const(") OR (")) };
+        }
+        combined = unsafe { concatenate(combined, pg_sys::copyObjectImpl(query.cast()).cast()) };
+    }
+    unsafe { concatenate(combined, text_const(")")) }
+}
+
+unsafe fn constant_texts(queries: &[*mut pg_sys::Node]) -> Option<Vec<String>> {
+    let mut text = Vec::with_capacity(queries.len());
+    for &query in queries {
+        if query.is_null() || unsafe { (*query).type_ } != pg_sys::NodeTag::T_Const {
+            return None;
+        }
+        let value = unsafe { &*query.cast::<pg_sys::Const>() };
+        if value.constisnull || value.consttype != pg_sys::TEXTOID {
+            return None;
+        }
+        let value = unsafe { String::from_datum(value.constvalue, false) }?;
+        text.push(format!("({value})"));
+    }
+    Some(text)
 }
 
 #[pg_extern(immutable, parallel_unsafe)]
@@ -221,20 +226,14 @@ fn highlight_support(request: Internal) -> Internal {
             return unhandled();
         }
         let document = pg_sys::list_nth((*request.fcall).args, 0).cast::<pg_sys::Node>();
-        let mut vars = VarContext {
-            varno: 0,
-            seen: false,
-            valid: true,
-        };
-        collect_varno(document, (&mut vars as *mut VarContext).cast());
-        if !vars.valid || !vars.seen {
+        let Some(varno) = crate::score::single_varno(document) else {
             return unhandled();
-        }
+        };
         let parse = (*request.root).parse;
-        let rte = pg_sys::list_nth((*parse).rtable, vars.varno - 1).cast::<pg_sys::RangeTblEntry>();
+        let rte = pg_sys::list_nth((*parse).rtable, varno - 1).cast::<pg_sys::RangeTblEntry>();
         if rte.is_null()
             || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
-            || crate::score::find_matching_tin_index((*rte).relid, vars.varno, document).is_none()
+            || crate::score::find_matching_tin_index((*rte).relid, varno, document).is_none()
         {
             return unhandled();
         }
@@ -242,8 +241,9 @@ fn highlight_support(request: Internal) -> Internal {
             document,
             queries: Vec::new(),
         };
+        // Pulled-up subqueries leave their quals in nested FromExpr nodes.
         collect_queries(
-            (*(*parse).jointree).quals.cast::<pg_sys::Node>(),
+            (*parse).jointree.cast::<pg_sys::Node>(),
             (&mut binding as *mut QueryContext).cast(),
         );
         if binding.queries.is_empty() {
@@ -281,6 +281,44 @@ ALTER FUNCTION @extschema@.highlight_ansi(pg_catalog.text, pg_catalog.int4, pg_c
 mod tests {
     use super::*;
     use pgrx::pg_test;
+
+    fn create_highlight_table() {
+        pgrx::Spi::run(
+            "CREATE TABLE lite_highlight_quals (id int, title text);
+             INSERT INTO lite_highlight_quals VALUES (1, 'alpha zeta filler');
+             CREATE INDEX ON lite_highlight_quals USING tin (title);",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn parameterized_quals_highlight_every_term() {
+        create_highlight_table();
+        pgrx::Spi::run(
+            "PREPARE lite_highlight(text, text) AS
+               SELECT tin.highlight(title) FROM lite_highlight_quals
+               WHERE title ==> $1 AND title ==> $2",
+        )
+        .unwrap();
+        let marked = pgrx::Spi::get_one::<String>("EXECUTE lite_highlight('alpha', 'zeta')")
+            .unwrap()
+            .unwrap();
+        assert_eq!(marked, "<b>alpha</b> <b>zeta</b> filler");
+    }
+
+    #[pg_test]
+    fn highlighting_survives_subquery_pullup() {
+        create_highlight_table();
+        let marked = pgrx::Spi::get_one::<String>(
+            "SELECT h FROM (
+               SELECT tin.highlight(title) AS h FROM lite_highlight_quals
+               WHERE title ==> 'zeta'
+             ) AS marked",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(marked, "alpha <b>zeta</b> filler");
+    }
 
     #[pg_test]
     fn explicit_html_and_ansi_highlighting_render_matches() {
