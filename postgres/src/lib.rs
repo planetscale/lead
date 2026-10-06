@@ -419,8 +419,8 @@ mod tests {
         Spi::run(
             "CREATE TABLE lite_stale (title text);
              CREATE INDEX ON lite_stale USING tin (title);
-             ALTER FUNCTION tin.score_bound(text, text[], int4, int4, int4,
-               float4, float4, float4, text[], text[]) RENAME TO score_bound_stale;",
+             ALTER FUNCTION tin.score_bound(text[], text[], int4[], int4, int4[], bool[],
+               int4, float4, float4, float4, text[], text[]) RENAME TO score_bound_stale;",
         )
         .unwrap();
         Spi::run("SELECT tin.score(ctid) FROM lite_stale WHERE title ==> 'lorem'").unwrap();
@@ -744,6 +744,319 @@ mod tests {
                 "SELECT {full} FROM lite_twin WHERE active AND body ==> 'beer'"
             )),
             active
+        );
+    }
+
+    #[pg_test]
+    fn scores_across_indexed_columns_do_not_depend_on_predicate_order() {
+        Spi::run(
+            "CREATE TABLE lite_fields (id int, title text, body text);
+             INSERT INTO lite_fields VALUES (1, 'quiet', 'ruby ruby'), (2, 'ruby', 'quiet');
+             CREATE INDEX ON lite_fields USING tin (title);
+             CREATE INDEX ON lite_fields USING tin (body);",
+        )
+        .unwrap();
+        let full = "SELECT array_agg(tin.full_score(ctid) ORDER BY id) FROM lite_fields WHERE";
+        // tin scores each row by the one column it matches, in either order:
+        // 0.87138504 and 0.6931472, which is ln 2.
+        for quals in [
+            "title ==> 'ruby' OR body ==> 'ruby'",
+            "body ==> 'ruby' OR title ==> 'ruby'",
+        ] {
+            assert_eq!(
+                scores_by_id(&format!("{full} {quals}")),
+                [0.871_385_04, std::f32::consts::LN_2],
+                "{quals}"
+            );
+        }
+        let title = scores_by_id(&format!("{full} title ==> 'quiet'"));
+        let body = scores_by_id(&format!("{full} body ==> 'ruby'"));
+        for quals in [
+            "title ==> 'quiet' AND body ==> 'ruby'",
+            "body ==> 'ruby' AND title ==> 'quiet'",
+        ] {
+            assert_eq!(
+                scores_by_id(&format!("{full} {quals}")),
+                [title[0] + body[0]],
+                "{quals}"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn scores_across_indexed_columns_sum_per_column_scores() {
+        Spi::run(
+            "CREATE TABLE lite_field_sums (id int, title text, body text);
+             INSERT INTO lite_field_sums VALUES
+               (1, 'alpha title', 'beta body only'),
+               (2, 'beta title', 'alpha body only'),
+               (3, 'alpha beta', 'alpha beta both'),
+               (4, 'gamma', 'delta');
+             CREATE INDEX ON lite_field_sums USING tin (title);
+             CREATE INDEX ON lite_field_sums USING tin (body);",
+        )
+        .unwrap();
+        let scores = |quals: &str| {
+            scores_by_id(&format!(
+                "SELECT array_agg(tin.full_score(ctid) ORDER BY id)
+                   || array_agg(tin.max_score(ctid) ORDER BY id)
+                 FROM lite_field_sums WHERE {quals}"
+            ))
+        };
+        let title = scores("title ==> 'alpha'");
+        let body = scores("body ==> 'alpha'");
+        // tin's multi-index scan returns these scores and this maximum.
+        let (title_only, body_only, both) = (0.654_875_3, 0.640_724_24, 1.295_599_5);
+        assert_eq!(
+            [title_only, body_only, both],
+            [title[0], body[0], title[1] + body[1]]
+        );
+        assert_eq!(
+            scores("title ==> 'alpha' OR body ==> 'alpha'"),
+            [title_only, body_only, both, both, both, both]
+        );
+        assert_eq!(
+            scores("body ==> 'alpha' AND title ==> 'alpha'"),
+            [both, both]
+        );
+    }
+
+    #[pg_test]
+    fn max_score_across_indexed_columns_counts_rows_the_quals_admit() {
+        Spi::run(
+            "CREATE TABLE lite_field_max (id int, title text, body text);
+             INSERT INTO lite_field_max VALUES
+               (1, 'ruby ruby ruby', 'nothing here'),
+               (2, 'ruby and many other title words', 'ruby with plenty of other body words'),
+               (3, 'gems', 'gems'), (4, NULL, 'ruby gems'), (5, 'rails', NULL);
+             CREATE INDEX ON lite_field_max USING tin (title);
+             CREATE INDEX ON lite_field_max USING tin (body);",
+        )
+        .unwrap();
+        let scores = |quals: &str| {
+            scores_by_id(&format!(
+                "SELECT array_agg(tin.full_score(ctid) ORDER BY id) || max(tin.max_score(ctid))
+                 FROM lite_field_max WHERE {quals}"
+            ))
+        };
+        // The single-column match in row 1 outscores row 2, which alone
+        // matches both columns when the quals require both.
+        assert_eq!(
+            scores("title ==> 'ruby' OR body ==> 'ruby'"),
+            [1.068_417_9, 0.915_753_84, 0.802_591_5, 1.068_417_9]
+        );
+        for quals in [
+            "body ==> 'ruby' AND title ==> 'ruby'",
+            "title ==> 'ruby' AND (body ==> 'ruby' OR body ==> 'gems')",
+        ] {
+            assert_eq!(scores(quals), [0.915_753_84, 0.915_753_84], "{quals}");
+        }
+        // NULL columns score nothing.
+        assert_eq!(
+            scores("title ==> 'ruby OR rails' OR body ==> 'gems'"),
+            [
+                1.068_417_9,
+                0.467_246_86,
+                0.953_077_44,
+                0.802_591_5,
+                1.627_717_5,
+                1.627_717_5
+            ]
+        );
+    }
+
+    #[pg_test]
+    fn scoring_skips_columns_whose_partial_index_the_quals_do_not_imply() {
+        Spi::run(
+            "CREATE TABLE lite_field_partial (id int, title text, body text, active boolean);
+             INSERT INTO lite_field_partial VALUES
+               (1, 'ruby', 'ruby', true), (2, 'ruby', 'quiet', false),
+               (3, 'quiet', 'ruby ruby', true), (4, 'other', 'words', true);
+             CREATE INDEX ON lite_field_partial USING tin (title) WHERE active;
+             CREATE INDEX ON lite_field_partial USING tin (body);",
+        )
+        .unwrap();
+        let full =
+            "SELECT array_agg(tin.full_score(ctid) ORDER BY id) FROM lite_field_partial WHERE";
+        let body = scores_by_id(&format!("{full} body ==> 'ruby'"));
+        assert_eq!(body, [0.754_912_8, 0.815_467_3]);
+        // Without `active`, only the body search can score and the title
+        // search filters, as in tin.
+        assert_eq!(
+            scores_by_id(&format!("{full} title ==> 'ruby' AND body ==> 'ruby'")),
+            body[..1]
+        );
+        assert_eq!(
+            scores_by_id(&format!(
+                "{full} active AND (title ==> 'ruby' OR body ==> 'ruby')"
+            )),
+            [1.735_742, 0.815_467_3]
+        );
+    }
+
+    #[pg_test(error = "cannot compute scores for this query")]
+    fn scoring_refuses_an_unindexed_alternative_to_an_indexed_search() {
+        Spi::run(
+            "CREATE TABLE lite_field_unscannable (id int, title text, body text, active boolean);
+             INSERT INTO lite_field_unscannable VALUES (1, 'ruby', 'ruby', true);
+             CREATE INDEX ON lite_field_unscannable USING tin (title) WHERE active;
+             CREATE INDEX ON lite_field_unscannable USING tin (body);",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT tin.full_score(ctid) FROM lite_field_unscannable
+             WHERE title ==> 'ruby' OR body ==> 'ruby'",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn rows_that_no_search_admits_have_no_score() {
+        Spi::run(
+            "CREATE TABLE lite_unsearched (id int, body text, active boolean);
+             INSERT INTO lite_unsearched VALUES
+               (1, 'gems', false), (2, 'gems gems', false),
+               (3, 'words', true), (4, 'other words', false);
+             CREATE INDEX ON lite_unsearched USING tin (body);",
+        )
+        .unwrap();
+        let scores = |select: &str, quals: &str| {
+            Spi::get_one::<Vec<Option<f32>>>(&format!(
+                "SELECT {select} FROM lite_unsearched WHERE {quals}"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        // The scores tin returns: the row only `id = 4` or `active` admits
+        // has none, and max_score still reports the searched maximum.
+        for quals in ["body ==> 'gems' OR id = 4", "body ==> 'gems' OR active"] {
+            let max = Some(0.871_385_04);
+            assert_eq!(
+                scores(
+                    "array_agg(tin.full_score(ctid) ORDER BY id)
+                     || array_agg(tin.max_score(ctid) ORDER BY id)",
+                    quals
+                ),
+                [Some(0.802_591_5), max, None, max, max, max],
+                "{quals}"
+            );
+            assert_eq!(
+                scores("array_agg(tin.score(ctid) ORDER BY id)", quals),
+                [Some(0.0), Some(0.0), None],
+                "{quals}"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn max_score_adapts_to_the_relations_score_calls() {
+        Spi::run(
+            "CREATE TABLE lite_max_policy (id int, title text, body text);
+             INSERT INTO lite_max_policy SELECT g, 'filler ' || g, 'padding ' || g
+               FROM generate_series(1, 40) AS g;
+             UPDATE lite_max_policy SET body = 'ruby ruby ruby' WHERE id = 1;
+             UPDATE lite_max_policy SET body = 'ruby and other body words' WHERE id = 2;
+             UPDATE lite_max_policy SET body = 'ruby gems', title = 'gems' WHERE id = 3;
+             UPDATE lite_max_policy SET body = 'gems' WHERE id = 4;
+             CREATE INDEX ON lite_max_policy USING tin (title);
+             CREATE INDEX ON lite_max_policy USING tin (body);",
+        )
+        .unwrap();
+        let max = |select: &str, quals: &str| {
+            Spi::get_one::<f32>(&format!(
+                "SELECT max(tin.max_score(ctid)){select} FROM lite_max_policy WHERE {quals}"
+            ))
+            .unwrap()
+        };
+        let full = max(", max(tin.full_score(ctid))", "body ==> 'ruby'");
+        assert!(full.is_some_and(|full| full > 0.0));
+        // Alone, max_score reports the full_score maximum, as tin does.
+        assert_eq!(max("", "body ==> 'ruby'"), full);
+        // Beside tin.score it takes that call's policy, which elides ruby,
+        // in 3 of 40 documents, at a dense_ratio of 0.05.
+        assert_eq!(max(", max(tin.score(ctid))", "body ==> 'ruby'"), full);
+        assert_eq!(
+            max(", max(tin.score(ctid, 0.05))", "body ==> 'ruby'"),
+            Some(0.0)
+        );
+        // tin computes no maximum under the score policy for several scans.
+        for quals in [
+            "title ==> 'gems' OR body ==> 'ruby'",
+            "body ==> 'ruby' OR id = 5",
+        ] {
+            assert_eq!(max(", max(tin.score(ctid))", quals), None, "{quals}");
+            assert!(max("", quals).is_some_and(|max| max > 0.0), "{quals}");
+        }
+        assert!(
+            max(
+                ", max(tin.score(ctid))",
+                "body ==> 'ruby' OR body ==> 'gems'"
+            )
+            .is_some_and(|max| max > 0.0)
+        );
+    }
+
+    #[pg_test(
+        error = "tin.score() and tin.full_score() cannot be combined on one scanned relation; use one scoring function per relation (tin.max_score() adapts to either)"
+    )]
+    fn score_and_full_score_cannot_score_one_relation() {
+        Spi::run(
+            "CREATE TABLE lite_mixed_family (body text);
+             CREATE INDEX ON lite_mixed_family USING tin (body);
+             SELECT tin.score(ctid), tin.full_score(ctid) FROM lite_mixed_family
+             WHERE body ==> 'ruby';",
+        )
+        .unwrap();
+    }
+
+    #[pg_test(error = "tin.score() calls on one relation must use identical dense_ratio arguments")]
+    fn score_calls_on_one_relation_share_their_scan_arguments() {
+        Spi::run(
+            "CREATE TABLE lite_mixed_ratio (body text);
+             CREATE INDEX ON lite_mixed_ratio USING tin (body);
+             SELECT tin.score(ctid), tin.score(ctid, 0.5) FROM lite_mixed_ratio
+             WHERE body ==> 'ruby';",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn other_search_operators_do_not_bind_scoring_or_highlighting() {
+        Spi::run(
+            "CREATE TABLE lite_other_operator (id int, body text);
+             INSERT INTO lite_other_operator VALUES (1, 'beer wine'), (2, 'beer'), (3, 'cider');
+             CREATE INDEX ON lite_other_operator USING tin (body);
+             CREATE SCHEMA lite_other;
+             CREATE FUNCTION lite_other.longer_than(text, int) RETURNS boolean
+               LANGUAGE sql IMMUTABLE AS 'SELECT length($1) > $2';
+             CREATE OPERATOR lite_other.==> (
+               LEFTARG = text, RIGHTARG = int, FUNCTION = lite_other.longer_than);",
+        )
+        .unwrap();
+        let rows = |select: &str, quals: &str| {
+            Spi::get_one::<Vec<String>>(&format!(
+                "SELECT array_agg(({select})::text ORDER BY id)
+                 FROM lite_other_operator WHERE {quals}"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        let other = "body OPERATOR(lite_other.==>) 3";
+        for select in [
+            "tin.score(ctid)",
+            "tin.full_score(ctid)",
+            "tin.max_score(ctid)",
+            "tin.highlight(body)",
+        ] {
+            assert_eq!(
+                rows(select, &format!("body ==> 'beer' AND {other}")),
+                rows(select, "body ==> 'beer'"),
+                "{select}"
+            );
+        }
+        assert_eq!(
+            rows("tin.highlight(body)", other),
+            ["beer wine", "beer", "cider"]
         );
     }
 

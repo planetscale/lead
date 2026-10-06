@@ -132,20 +132,10 @@ unsafe extern "C-unwind" fn collect_queries(node: *mut pg_sys::Node, context: *m
         return false;
     }
     let context = unsafe { &mut *context.cast::<QueryContext>() };
-    if unsafe { (*node).type_ } == pg_sys::NodeTag::T_OpExpr {
-        let op = node.cast::<pg_sys::OpExpr>();
-        let name = unsafe { pg_sys::get_opname((*op).opno) };
-        if !name.is_null()
-            && unsafe { CStr::from_ptr(name) }.to_bytes() == b"==>"
-            && unsafe { pg_sys::list_length((*op).args) } == 2
-        {
-            let left = unsafe { pg_sys::list_nth((*op).args, 0).cast::<pg_sys::Node>() };
-            if unsafe { pg_sys::equal(left.cast(), context.document.cast()) } {
-                context
-                    .queries
-                    .push(unsafe { pg_sys::list_nth((*op).args, 1).cast::<pg_sys::Node>() });
-            }
-        }
+    if let Some((document, query)) = unsafe { crate::operator::search_operands(node) }
+        && unsafe { pg_sys::equal(document.cast(), context.document.cast()) }
+    {
+        context.queries.push(query);
     }
     unsafe {
         pg_sys::expression_tree_walker(

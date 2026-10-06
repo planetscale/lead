@@ -16,7 +16,7 @@
 // The full license text is available in LICENSE.
 #[allow(unused_imports)]
 use crate::am::amhandler;
-use pgrx::{extension_sql, pg_extern};
+use pgrx::{extension_sql, pg_extern, pg_sys};
 use tinql::runtime::{
     Query, SimplificationProfile, evaluate, lower::lower, simplify, subtokenize::sub_tokenize,
     tokenize_doc,
@@ -28,6 +28,45 @@ fn parse_search<T: Tokenizer>(query_text: &str, tokenizer: &T) -> Result<Query, 
     let parsed = tinql::parse(query_text, tinql::ImplicitOp::And).map_err(|e| e.to_string())?;
     let analyzed = sub_tokenize(parsed, tokenizer).map_err(|e| e.to_string())?;
     lower(&analyzed).map_err(|e| e.to_string())
+}
+
+/// Returns the OID of Lead's `==>(text, text)` operator, or `InvalidOid` if
+/// it does not exist. It is looked up on each call because the extension can
+/// be dropped and recreated.
+fn search_operator() -> pg_sys::Oid {
+    unsafe {
+        let mut names = std::ptr::null_mut();
+        for name in [c"pg_catalog", c"==>"] {
+            names = pg_sys::lappend(
+                names,
+                pg_sys::makeString(pg_sys::pstrdup(name.as_ptr())).cast(),
+            );
+        }
+        pg_sys::OpernameGetOprid(names, pg_sys::TEXTOID, pg_sys::TEXTOID)
+    }
+}
+
+/// Returns the document and query operands of `node` when it is a search
+/// with Lead's `==>` operator. Operators of the same name in other schemas
+/// or for other types are not searches.
+///
+/// # Safety
+/// `node` must be a valid expression node.
+pub(crate) unsafe fn search_operands(
+    node: *mut pg_sys::Node,
+) -> Option<(*mut pg_sys::Node, *mut pg_sys::Node)> {
+    unsafe {
+        if (*node).type_ != pg_sys::NodeTag::T_OpExpr {
+            return None;
+        }
+        let op = &*node.cast::<pg_sys::OpExpr>();
+        if op.opno != search_operator() || pg_sys::list_length(op.args) != 2 {
+            return None;
+        }
+        let left = pg_sys::list_nth(op.args, 0).cast::<pg_sys::Node>();
+        let right = pg_sys::list_nth(op.args, 1).cast::<pg_sys::Node>();
+        (!left.is_null()).then_some((left, right))
+    }
 }
 
 fn invalid_search(error: String) -> ! {
