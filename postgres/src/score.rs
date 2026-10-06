@@ -602,7 +602,95 @@ pub(crate) unsafe fn single_varno(node: *mut pg_sys::Node) -> Option<i32> {
     (binding.valid && binding.seen).then_some(binding.varno)
 }
 
+/// Collects the qual expressions that every output row's entry for `varno`
+/// satisfies, and reports whether `varno` lies under `node`. WHERE and inner
+/// join quals restrict every relation below them. An outer join's ON clause
+/// restricts only its nullable side, since the preserved side keeps its rows
+/// whether or not the clause holds.
+unsafe fn collect_restrictions(
+    node: *mut pg_sys::Node,
+    varno: i32,
+    quals: &mut Vec<*mut pg_sys::Node>,
+) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    unsafe {
+        match (*node).type_ {
+            pg_sys::NodeTag::T_RangeTblRef => {
+                (*node.cast::<pg_sys::RangeTblRef>()).rtindex == varno
+            }
+            pg_sys::NodeTag::T_FromExpr => {
+                let from = &*node.cast::<pg_sys::FromExpr>();
+                let mut contains = false;
+                for child in PgList::<pg_sys::Node>::from_pg(from.fromlist).iter_ptr() {
+                    contains |= collect_restrictions(child, varno, quals);
+                }
+                if contains {
+                    quals.push(from.quals);
+                }
+                contains
+            }
+            pg_sys::NodeTag::T_JoinExpr => {
+                let join = &*node.cast::<pg_sys::JoinExpr>();
+                let left = collect_restrictions(join.larg, varno, quals);
+                let right = collect_restrictions(join.rarg, varno, quals);
+                let restricted = match join.jointype {
+                    pg_sys::JoinType::JOIN_INNER => left || right,
+                    pg_sys::JoinType::JOIN_LEFT => right,
+                    pg_sys::JoinType::JOIN_RIGHT | pg_sys::JoinType::JOIN_SEMI => left,
+                    _ => false,
+                };
+                if restricted {
+                    quals.push(join.quals);
+                }
+                left || right
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Returns the clauses, in the form `predicate_implied_by` compares against an
+/// index predicate, that restrict relation `varno` in `parse`. Scoring
+/// support runs while the target list is preprocessed, before the jointree
+/// quals are simplified, so they are simplified here the way the planner
+/// would. Outer join nulling marks are dropped: a row that a join null-extends
+/// has no document to score or highlight, and every other row carries its
+/// own values.
+unsafe fn restriction_clauses(parse: *mut pg_sys::Query, varno: i32) -> *mut pg_sys::List {
+    unsafe {
+        let mut quals = Vec::new();
+        collect_restrictions((*parse).jointree.cast(), varno, &mut quals);
+        let every_relation = pg_sys::bms_add_range(
+            std::ptr::null_mut(),
+            1,
+            pg_sys::list_length((*parse).rtable),
+        );
+        let mut clauses = std::ptr::null_mut();
+        for qual in quals {
+            if qual.is_null() {
+                continue;
+            }
+            let qual = pg_sys::copyObjectImpl(qual.cast()).cast::<pg_sys::Node>();
+            let qual = pg_sys::remove_nulling_relids(qual, every_relation, std::ptr::null());
+            // Without a planner root, support functions decline to rewrite,
+            // so this cannot reenter scoring support.
+            let qual = pg_sys::eval_const_expressions(std::ptr::null_mut(), qual);
+            let qual = pg_sys::canonicalize_qual(qual.cast(), false);
+            clauses = pg_sys::list_concat(clauses, pg_sys::make_ands_implicit(qual));
+        }
+        clauses
+    }
+}
+
+/// Returns the tin index that scoring and highlighting bind `operand` to, the
+/// way tin selects one: a partial index qualifies only when the query's quals
+/// on the relation imply its predicate. Lead's indexes store no pages, so of
+/// the qualifying indexes the newest partial one wins, then the newest full
+/// one.
 pub(crate) unsafe fn find_matching_tin_index(
+    parse: *mut pg_sys::Query,
     heap_oid: pg_sys::Oid,
     query_varno: i32,
     operand: *mut pg_sys::Node,
@@ -619,7 +707,8 @@ pub(crate) unsafe fn find_matching_tin_index(
     let normalized = unsafe { pg_sys::strip_implicit_coercions(normalized) };
     let heap = unsafe { pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as _) };
     let indexes = unsafe { PgList::<pg_sys::Oid>::from_pg(pg_sys::RelationGetIndexList(heap)) };
-    let mut matched = None;
+    let mut clauses = None;
+    let mut matched: Option<(bool, u32)> = None;
     for index_oid in indexes.iter_oid() {
         let index = unsafe { pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _) };
         let metadata = unsafe { &*(*index).rd_index };
@@ -649,14 +738,108 @@ pub(crate) unsafe fn find_matching_tin_index(
         } else {
             false
         };
+        let predicate = if matches {
+            unsafe { pg_sys::RelationGetIndexPredicate(index) }
+        } else {
+            std::ptr::null_mut()
+        };
+        let partial = !predicate.is_null();
+        let eligible = matches
+            && (!partial
+                || unsafe {
+                    pg_sys::ChangeVarNodes(predicate.cast(), 1, query_varno, 0);
+                    let clauses =
+                        *clauses.get_or_insert_with(|| restriction_clauses(parse, query_varno));
+                    pg_sys::predicate_implied_by(predicate, clauses, false)
+                });
         unsafe { pg_sys::index_close(index, pg_sys::AccessShareLock as _) };
-        if matches {
-            matched = Some(index_oid);
-            break;
+        let choice = (partial, index_oid.to_u32());
+        if eligible && matched.is_none_or(|best| choice > best) {
+            matched = Some(choice);
         }
     }
     unsafe { pg_sys::table_close(heap, pg_sys::AccessShareLock as _) };
-    matched
+    matched.map(|(_, index_oid)| pg_sys::Oid::from(index_oid))
+}
+
+/// Refuses scoring when none of the relation's search expressions has a tin
+/// index to score against, with the error tin raises for the same query.
+unsafe fn refuse_unindexed_scoring(
+    rte: *mut pg_sys::RangeTblEntry,
+    varno: i32,
+    operands: &[*mut pg_sys::Node],
+) -> ! {
+    let expressions = unsafe {
+        let context = pg_sys::deparse_context_for(pg_sys::get_rel_name((*rte).relid), (*rte).relid);
+        operands
+            .iter()
+            .map(|&operand| deparse_search_expression(operand, varno, context))
+            .collect::<Option<Vec<_>>>()
+    };
+    let detail = match expressions {
+        Some(mut expressions) if !expressions.is_empty() => {
+            expressions.sort_unstable();
+            expressions.dedup();
+            format!("No matching tin index for: {}.", expressions.join(", "))
+        }
+        _ => "One or more search expressions have no matching tin index.".to_owned(),
+    };
+    pg_sys::panic::ErrorReport::new(
+        pg_sys::errcodes::PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+        "cannot compute scores for this query",
+        pgrx::function_name!(),
+    )
+    .set_detail(detail)
+    .set_hint("Add a matching USING tin index, or check the definition of an existing index.")
+    .report(pgrx::PgLogLevel::ERROR);
+    unreachable!("ERROR reports do not return")
+}
+
+/// Renders a search expression on relation `varno` against the relation's
+/// own name. Returns `None` for expressions a single-relation deparse context
+/// cannot describe.
+unsafe fn deparse_search_expression(
+    expression: *mut pg_sys::Node,
+    varno: i32,
+    context: *mut pg_sys::List,
+) -> Option<String> {
+    #[pg_guard]
+    unsafe extern "C-unwind" fn prepare(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
+        if node.is_null() {
+            return false;
+        }
+        unsafe {
+            match (*node).type_ {
+                pg_sys::NodeTag::T_Var => {
+                    let var = &mut *node.cast::<pg_sys::Var>();
+                    var.varno = 1;
+                    var.varnosyn = 0;
+                    var.varattnosyn = 0;
+                    var.varnullingrels = std::ptr::null_mut();
+                    false
+                }
+                pg_sys::NodeTag::T_Param => {
+                    (*node.cast::<pg_sys::Param>()).paramkind != pg_sys::ParamKind::PARAM_EXTERN
+                }
+                pg_sys::NodeTag::T_PlaceHolderVar
+                | pg_sys::NodeTag::T_SubLink
+                | pg_sys::NodeTag::T_SubPlan
+                | pg_sys::NodeTag::T_AlternativeSubPlan => true,
+                _ => pg_sys::expression_tree_walker(node, Some(prepare), context),
+            }
+        }
+    }
+    unsafe {
+        if single_varno(expression) != Some(varno) {
+            return None;
+        }
+        let copied = pg_sys::copyObjectImpl(expression.cast()).cast();
+        if prepare(copied, std::ptr::null_mut()) {
+            return None;
+        }
+        let rendered = pg_sys::deparse_expression(copied, context, true, false);
+        Some(CStr::from_ptr(rendered).to_string_lossy().into_owned())
+    }
 }
 
 struct FullScoreBinding {
@@ -746,13 +929,26 @@ fn score_support(request: Internal) -> Internal {
         if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
             return unhandled();
         }
+        let searches = binding
+            .matches
+            .iter()
+            .copied()
+            .filter(|&(document, _)| single_varno(document) == Some(ctid.varno))
+            .collect::<Vec<_>>();
+        if searches.is_empty() {
+            return unhandled();
+        }
         let Some((document, first_query, index_oid)) =
-            binding.matches.iter().find_map(|&(document, query)| {
-                find_matching_tin_index((*rte).relid, ctid.varno, document)
+            searches.iter().find_map(|&(document, query)| {
+                find_matching_tin_index(parse, (*rte).relid, ctid.varno, document)
                     .map(|index_oid| (document, query, index_oid))
             })
         else {
-            return unhandled();
+            let operands = searches
+                .iter()
+                .map(|&(document, _)| document)
+                .collect::<Vec<_>>();
+            refuse_unindexed_scoring(rte, ctid.varno, &operands);
         };
         let original_nargs = pg_sys::list_length((*request.fcall).args);
         let function_name = pg_sys::get_func_name((*request.fcall).funcid);

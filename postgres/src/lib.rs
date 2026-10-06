@@ -621,6 +621,85 @@ mod tests {
         assert_eq!(partial, control);
     }
 
+    fn scores_by_id(sql: &str) -> Vec<f32> {
+        Spi::get_one::<Vec<f32>>(sql).unwrap().unwrap()
+    }
+
+    #[pg_test]
+    fn scoring_binds_partial_indexes_the_quals_imply() {
+        Spi::run(
+            "CREATE TABLE lite_implied (id int, body text, active boolean);
+             INSERT INTO lite_implied VALUES
+               (1, 'beer wine', true), (2, 'beer', true), (3, 'wine', true);
+             INSERT INTO lite_implied
+               SELECT n, 'beer', false FROM generate_series(4, 40) AS n;
+             CREATE INDEX lite_implied_idx ON lite_implied USING tin (body) WHERE active;
+             CREATE TABLE lite_implied_control AS
+               SELECT id, body FROM lite_implied WHERE active;
+             CREATE INDEX lite_implied_control_idx ON lite_implied_control
+               USING tin (body);",
+        )
+        .unwrap();
+        let control = scores_by_id(
+            "SELECT array_agg(tin.full_score(ctid) + tin.max_score(ctid) ORDER BY id)
+             FROM lite_implied_control WHERE body ==> 'beer'",
+        );
+        assert_eq!(control.len(), 2);
+        for sql in [
+            "SELECT array_agg(tin.full_score(ctid) + tin.max_score(ctid) ORDER BY id)
+             FROM lite_implied WHERE active = true AND body ==> 'beer'",
+            // An outer join's ON clause restricts its nullable side.
+            "SELECT array_agg(tin.full_score(t.ctid) + tin.max_score(t.ctid) ORDER BY t.id)
+             FROM generate_series(1, 3) AS g(id)
+             LEFT JOIN lite_implied t ON t.id = g.id AND t.active AND t.body ==> 'beer'
+             WHERE t.id IS NOT NULL",
+            "SELECT array_agg(tin.full_score(t.ctid) + tin.max_score(t.ctid) ORDER BY t.id)
+             FROM generate_series(1, 3) AS g(id)
+             LEFT JOIN lite_implied t ON t.id = g.id
+             WHERE t.active AND t.body ==> 'beer'",
+        ] {
+            assert_eq!(scores_by_id(sql), control, "{sql}");
+        }
+    }
+
+    #[pg_test]
+    fn scoring_skips_partial_indexes_the_quals_do_not_imply() {
+        Spi::run(
+            "CREATE TABLE lite_twin (id int, body text, active boolean);
+             INSERT INTO lite_twin VALUES
+               (1, 'beer wine', true), (2, 'beer', true), (3, 'wine', true);
+             INSERT INTO lite_twin
+               SELECT n, 'beer', false FROM generate_series(4, 40) AS n;
+             CREATE INDEX lite_twin_partial_idx ON lite_twin USING tin (body) WHERE active;
+             CREATE INDEX lite_twin_full_idx ON lite_twin USING tin (body);
+             CREATE TABLE lite_twin_all AS SELECT id, body FROM lite_twin;
+             CREATE INDEX lite_twin_all_idx ON lite_twin_all USING tin (body);
+             CREATE TABLE lite_twin_active AS SELECT id, body FROM lite_twin WHERE active;
+             CREATE INDEX lite_twin_active_idx ON lite_twin_active USING tin (body);",
+        )
+        .unwrap();
+        let full = "array_agg(tin.full_score(ctid) ORDER BY id)";
+        let all = scores_by_id(&format!(
+            "SELECT {full} FROM lite_twin_all WHERE body ==> 'beer'"
+        ));
+        let active = scores_by_id(&format!(
+            "SELECT {full} FROM lite_twin_active WHERE body ==> 'beer'"
+        ));
+        assert_ne!(all[..2], active[..]);
+        assert_eq!(
+            scores_by_id(&format!(
+                "SELECT {full} FROM lite_twin WHERE body ==> 'beer'"
+            )),
+            all
+        );
+        assert_eq!(
+            scores_by_id(&format!(
+                "SELECT {full} FROM lite_twin WHERE active AND body ==> 'beer'"
+            )),
+            active
+        );
+    }
+
     #[pg_test]
     fn highlighting_supports_explicit_and_implicit_queries() {
         assert_eq!(
@@ -803,5 +882,64 @@ mod session_tests {
         writer
             .batch_execute("DROP TABLE lead_cursor_probe")
             .unwrap();
+    }
+
+    #[test]
+    fn unproved_partial_indexes_refuse_scoring_like_tin() {
+        let mut client = session();
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE lead_unproved (id integer, body text, active boolean);
+                 INSERT INTO lead_unproved VALUES (1, 'beer', true), (2, 'beer', false);
+                 CREATE INDEX ON lead_unproved USING tin (body) WHERE active;
+                 CREATE INDEX ON lead_unproved USING tin (lower(body)) WHERE active;",
+            )
+            .unwrap();
+        for (sql, expression) in [
+            (
+                "SELECT tin.score(ctid) FROM lead_unproved WHERE body ==> 'beer'",
+                "lead_unproved.body",
+            ),
+            (
+                "SELECT tin.full_score(t.ctid) FROM lead_unproved t
+                 WHERE lower(t.body) ==> 'beer' AND lower(t.body) ==> 'wine'",
+                "lower(lead_unproved.body)",
+            ),
+            (
+                "SELECT tin.max_score(ctid) FROM lead_unproved
+                 WHERE body ==> 'beer' AND active IS NOT NULL",
+                "lead_unproved.body",
+            ),
+            // An outer join's ON clause does not restrict its preserved side.
+            (
+                "SELECT tin.score(t.ctid) FROM lead_unproved t
+                 LEFT JOIN generate_series(1, 2) AS g(id) ON g.id = t.id AND t.active
+                 WHERE t.body ==> 'beer'",
+                "lead_unproved.body",
+            ),
+        ] {
+            let error = client.query(sql, &[]).unwrap_err();
+            let error = error
+                .as_db_error()
+                .unwrap_or_else(|| panic!("{sql}: {error}"));
+            assert_eq!(
+                (
+                    error.code().code(),
+                    error.message(),
+                    error.detail(),
+                    error.hint()
+                ),
+                (
+                    "0A000",
+                    "cannot compute scores for this query",
+                    Some(format!("No matching tin index for: {expression}.").as_str()),
+                    Some(
+                        "Add a matching USING tin index, or check the definition of an \
+                         existing index."
+                    ),
+                ),
+                "{sql}"
+            );
+        }
     }
 }

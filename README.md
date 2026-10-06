@@ -26,7 +26,7 @@ Then run `CREATE EXTENSION tin` in the database. Lead loads on demand and does n
 
 Lead provides the `tin` access method, the `==>` operator, TINQL parsing, tokenizer and index reloptions, and the scoring functions `tin.score`, `tin.full_score`, `tin.max_score`, and `tin.score_inspect`, plus explicit and implicitly bound `tin.highlight` and `tin.highlight_ansi`. Postgres 17 and 18 are build targets. Search results are exact because the access method returns whole-page candidates and Postgres evaluates `==>` against each visible heap tuple, including expression and partial-index rechecks.
 
-Scoring deliberately rescans and retokenizes the visible indexed column or expression, once per statement and search, under that statement's snapshot. A score call must be in the same query level as the matching `==>` predicate. Implicit highlighting has the same binding boundary; passing its `query` argument explicitly works without a bound predicate.
+Scoring deliberately rescans and retokenizes the visible indexed column or expression, once per statement and search, under that statement's snapshot. A score call must be in the same query level as the matching `==>` predicate, and a partial tin index binds only when the query's quals imply its `WHERE` condition, as in tin. Implicit highlighting has the same binding boundary; passing its `query` argument explicitly works without a bound predicate.
 
 ## Execution and storage
 
