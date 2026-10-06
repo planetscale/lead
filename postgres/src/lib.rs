@@ -312,6 +312,61 @@ mod tests {
         assert_eq!(nested, direct);
     }
 
+    #[pg_test]
+    fn scoring_binds_search_text_from_another_relation_per_row() {
+        Spi::run(
+            "CREATE TABLE lite_join_docs (id int, body text);
+             INSERT INTO lite_join_docs VALUES
+               (1, 'red sofa'), (2, 'blue sofa sofa'), (3, 'oak table'),
+               (4, 'pine table'), (5, 'glass table'), (6, 'green chair');
+             CREATE INDEX ON lite_join_docs USING tin (body);
+             CREATE TABLE lite_join_queries (query text);
+             INSERT INTO lite_join_queries VALUES ('sofa'), ('red'), ('red OR table');",
+        )
+        .unwrap();
+        let joined = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT q.query, d.id, tin.full_score(d.ctid)
+                     FROM lite_join_queries q JOIN lite_join_docs d ON d.body ==> q.query
+                     ORDER BY 1, 2",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| {
+                    (
+                        row.get::<String>(1).unwrap().unwrap(),
+                        row.get::<i32>(2).unwrap().unwrap(),
+                        row.get::<f32>(3).unwrap().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(joined.len(), 7, "{joined:?}");
+        for (query, id, score) in &joined {
+            let literal = Spi::get_one::<f32>(&format!(
+                "SELECT tin.full_score(ctid) FROM lite_join_docs
+                 WHERE body ==> '{query}' AND id = {id}"
+            ))
+            .unwrap();
+            assert_eq!(literal, Some(*score), "{query} / {id}");
+        }
+        let score = |search: &str, id| {
+            joined
+                .iter()
+                .find(|(query, row, _)| query == search && *row == id)
+                .unwrap()
+                .2
+        };
+        assert!(score("red", 1) > 0.0);
+        assert_ne!(score("red", 1), score("sofa", 1));
+    }
+
+    /// Lets the session tests below start the shared test server.
+    #[pg_test]
+    fn test_server_is_ready() {}
+
     #[pg_test(error = "tin.score_bound() is missing: the installed tin SQL predates this build")]
     fn scoring_reports_an_outdated_installed_extension() {
         Spi::run(
@@ -601,5 +656,140 @@ mod tests {
         .unwrap();
         assert!(ansi.contains("\x1b["));
         assert!(ansi.contains("Beer"));
+    }
+}
+
+/// Scoring checks that span several transactions or sessions, which a
+/// `#[pg_test]` cannot express because it runs inside one transaction.
+#[cfg(all(test, feature = "pg_test"))]
+mod session_tests {
+    fn session() -> postgres::Client {
+        pgrx_tests::run_test(
+            "test_server_is_ready",
+            None,
+            crate::pg_test::postgresql_conf_options(),
+        )
+        .unwrap();
+        pgrx_tests::client().unwrap().0
+    }
+
+    fn scores(client: &mut postgres::Client, sql: &str) -> Vec<(String, f32, f32)> {
+        client
+            .query(sql, &[])
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect()
+    }
+
+    const SOFA: &str = "SELECT body, tin.full_score(ctid), tin.max_score(ctid)
+                        FROM {table} WHERE body ==> 'sofa' ORDER BY id";
+
+    fn sofa(client: &mut postgres::Client, table: &str) -> Vec<(String, f32, f32)> {
+        scores(client, &SOFA.replace("{table}", table))
+    }
+
+    #[test]
+    fn successive_autocommit_statements_score_their_own_snapshot() {
+        let mut client = session();
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE lead_cache_probe (id integer PRIMARY KEY, body text);
+                 CREATE INDEX ON lead_cache_probe USING tin (body);",
+            )
+            .unwrap();
+        client
+            .execute("INSERT INTO lead_cache_probe VALUES (1, 'Blue sofa')", &[])
+            .unwrap();
+        let blue = sofa(&mut client, "lead_cache_probe");
+        assert_eq!(blue.len(), 1);
+        assert!((blue[0].1 - 0.2876821).abs() < 0.000001, "{blue:?}");
+        assert_eq!(blue[0].2, blue[0].1);
+
+        client
+            .execute("UPDATE lead_cache_probe SET body = 'Red sofa'", &[])
+            .unwrap();
+        assert_eq!(
+            sofa(&mut client, "lead_cache_probe"),
+            vec![("Red sofa".into(), blue[0].1, blue[0].1)]
+        );
+
+        client
+            .execute("UPDATE lead_cache_probe SET body = 'sofa sofa sofa'", &[])
+            .unwrap();
+        let repeated = sofa(&mut client, "lead_cache_probe");
+        assert!(repeated[0].1 > blue[0].1, "{repeated:?}");
+        assert_eq!(repeated[0].2, repeated[0].1);
+    }
+
+    #[test]
+    fn read_committed_statements_see_concurrent_commits_in_scores() {
+        let mut writer = session();
+        let mut reader = session();
+        writer
+            .batch_execute(
+                "DROP TABLE IF EXISTS lead_rc_probe;
+                 CREATE TABLE lead_rc_probe (id integer PRIMARY KEY, body text);
+                 CREATE INDEX ON lead_rc_probe USING tin (body);
+                 INSERT INTO lead_rc_probe VALUES (1, 'Blue sofa'), (2, 'green chair');",
+            )
+            .unwrap();
+        reader
+            .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SELECT pg_current_xact_id();")
+            .unwrap();
+        let blue = sofa(&mut reader, "lead_rc_probe");
+        assert_eq!(blue.len(), 1);
+        assert!(blue[0].1 > 0.0, "{blue:?}");
+
+        writer
+            .execute(
+                "UPDATE lead_rc_probe SET body = 'Red sofa' WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            sofa(&mut reader, "lead_rc_probe"),
+            vec![("Red sofa".into(), blue[0].1, blue[0].1)]
+        );
+        reader.batch_execute("COMMIT").unwrap();
+        writer.batch_execute("DROP TABLE lead_rc_probe").unwrap();
+    }
+
+    #[test]
+    fn corpus_statistics_use_the_statement_snapshot() {
+        let mut writer = session();
+        let mut reader = session();
+        writer
+            .batch_execute(
+                "DROP TABLE IF EXISTS lead_cursor_probe;
+                 CREATE TABLE lead_cursor_probe (id integer PRIMARY KEY, body text);
+                 CREATE INDEX ON lead_cursor_probe USING tin (body);
+                 INSERT INTO lead_cursor_probe VALUES (1, 'Blue sofa'), (2, 'green chair');",
+            )
+            .unwrap();
+        let before = sofa(&mut writer, "lead_cursor_probe");
+        assert_eq!(before.len(), 1);
+
+        // The cursor's snapshot predates the insert below, but the corpus is
+        // only read once the first row is fetched.
+        reader
+            .batch_execute(&format!(
+                "BEGIN ISOLATION LEVEL READ COMMITTED;
+                 DECLARE probe CURSOR FOR {};",
+                SOFA.replace("{table}", "lead_cursor_probe")
+            ))
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO lead_cursor_probe VALUES (3, 'sofa sofa'), (4, 'leather sofa')",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(scores(&mut reader, "FETCH ALL FROM probe"), before);
+        reader.batch_execute("COMMIT").unwrap();
+        assert_ne!(sofa(&mut writer, "lead_cursor_probe")[0], before[0]);
+        writer
+            .batch_execute("DROP TABLE lead_cursor_probe")
+            .unwrap();
     }
 }

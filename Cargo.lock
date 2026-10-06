@@ -1780,6 +1780,7 @@ dependencies = [
  "boldi-vigna",
  "pgrx",
  "pgrx-tests",
+ "postgres",
  "rustc-hash",
  "thiserror",
  "tinql",
