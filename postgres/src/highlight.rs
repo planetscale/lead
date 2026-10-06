@@ -157,18 +157,13 @@ pub(crate) fn rewrap_text(text: &str, wrap_to: usize) -> String {
     output
 }
 
-/// Parses a tinql query and evaluates it against the document text to produce
-/// match positions inline. Used when the planner injects the query text for
-/// highlight evaluation.
+/// Evaluates a parsed query against the document text to produce match
+/// positions inline.
 ///
-/// Uses the built-in default analyzer pipeline for both the query and document.
-pub(crate) fn positions_from_query(tinql_text: &str, text: &str) -> Vec<MatchPosition> {
-    let query = match tinql::runtime::parse_tinql_to_query_default(tinql_text) {
-        Ok(query) => query,
-        Err(_) => return Vec::new(),
-    };
+/// Uses the built-in default analyzer pipeline for the document.
+pub(crate) fn query_positions(query: &tinql::runtime::Query, text: &str) -> Vec<MatchPosition> {
     let doc = tinql::runtime::tokenize_doc(text, tokenizer::presets::default_pipeline());
-    let matches = tinql::runtime::evaluate_for_highlight(&query, &doc);
+    let matches = tinql::runtime::evaluate_for_highlight(query, &doc);
     matches
         .into_iter()
         .map(|m| {

@@ -68,13 +68,13 @@ impl TryFrom<i32> for ScoreMode {
 }
 
 /// Identifies one search that a `score_bound` call site scores rows against.
-/// The search text can vary per row, as in `t.body ==> q.text` driven by a
+/// The search texts can vary per row, as in `t.body ==> q.text` driven by a
 /// join, so a call site may hold several of these.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CorpusKey {
     heap_oid: u32,
     index_oid: u32,
-    query: String,
+    queries: Vec<String>,
     mode: ScoreMode,
     dense: u32,
     k1: Option<u32>,
@@ -163,16 +163,14 @@ fn score_bound(
 ) -> f32 {
     let mode = ScoreMode::try_from(mode)
         .unwrap_or_else(|mode| pgrx::error!("tin.score_bound(): unknown score mode {mode}"));
-    let mut parts = Vec::with_capacity(query.len());
-    for part in query {
-        // A NULL search expression matches no rows, so nothing needs a score.
-        let Some(part) = part else { return 0.0 };
-        parts.push(format!("({part})"));
-    }
+    // A NULL search expression matches no rows, so nothing needs a score.
+    let Some(queries) = query.into_iter().collect::<Option<Vec<_>>>() else {
+        return 0.0;
+    };
     let key = CorpusKey {
         heap_oid: heap_oid as u32,
         index_oid: index_oid as u32,
-        query: parts.join(" OR "),
+        queries,
         mode,
         dense: dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits(),
         k1: bits(k1),
@@ -236,8 +234,7 @@ fn build_corpus(
     if !full && !dense.is_valid() {
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
-    let query = parse_tinql_to_query(&key.query, &tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("TIN score query error: {error}"));
+    let query = crate::operator::parse_searches(&key.queries, &tokenizer);
     let mut inputs = Vec::new();
     collect_score_terms(&query, 1.0, false, &mut inputs);
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
@@ -1047,6 +1044,11 @@ unsafe fn make_query_array(
     if elements.is_empty() {
         elements.push(unsafe { pg_sys::copyObjectImpl(first_query.cast()).cast() });
     }
+    unsafe { make_text_array(elements) }
+}
+
+/// Builds a `text[]` expression from `text` expressions.
+pub(crate) unsafe fn make_text_array(elements: PgList<pg_sys::Node>) -> *mut pg_sys::Node {
     let mut array = unsafe { PgBox::<pg_sys::ArrayExpr>::alloc_node(pg_sys::NodeTag::T_ArrayExpr) };
     array.array_typeid = pg_sys::TEXTARRAYOID;
     array.array_collid = pg_sys::DEFAULT_COLLATION_OID;
@@ -1086,8 +1088,6 @@ unsafe fn make_null_const(type_oid: pg_sys::Oid) -> *mut pg_sys::Const {
 }
 
 unsafe fn lookup_score_bound() -> pg_sys::Oid {
-    let name = CString::new("tin.score_bound").unwrap();
-    let names = unsafe { pg_sys::stringToQualifiedNameList(name.as_ptr(), std::ptr::null_mut()) };
     let types = [
         pg_sys::TEXTOID,
         pg_sys::TEXTARRAYOID,
@@ -1100,12 +1100,21 @@ unsafe fn lookup_score_bound() -> pg_sys::Oid {
         pg_sys::TEXTARRAYOID,
         pg_sys::TEXTARRAYOID,
     ];
+    unsafe { lookup_bound_function(c"tin.score_bound", &types) }
+}
+
+/// Looks up a function that a support function rewrites calls into.
+pub(crate) unsafe fn lookup_bound_function(name: &CStr, types: &[pg_sys::Oid]) -> pg_sys::Oid {
+    let names = unsafe { pg_sys::stringToQualifiedNameList(name.as_ptr(), std::ptr::null_mut()) };
     let oid = unsafe { pg_sys::LookupFuncName(names, types.len() as i32, types.as_ptr(), true) };
     if oid == pg_sys::InvalidOid {
         pgrx::ereport!(
             ERROR,
             pg_sys::errcodes::PgSqlErrorCode::ERRCODE_UNDEFINED_FUNCTION,
-            "tin.score_bound() is missing: the installed tin SQL predates this build",
+            format!(
+                "{}() is missing: the installed tin SQL predates this build",
+                name.to_string_lossy()
+            ),
             "Lead ships no extension upgrade scripts, so the extension has to be \
              reinstalled: DROP EXTENSION tin CASCADE; CREATE EXTENSION tin; \
              CASCADE also drops every tin index and anything else that depends on \

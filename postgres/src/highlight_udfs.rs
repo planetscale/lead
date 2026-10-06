@@ -14,48 +14,49 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 // The full license text is available in LICENSE.
-use crate::highlight::{highlight_text, highlight_text_ansi, positions_from_query, rewrap_text};
-use pgrx::{FromDatum, Internal, IntoDatum, PgList, default, pg_extern, pg_guard, pg_sys};
+use crate::highlight::{highlight_text, highlight_text_ansi, query_positions, rewrap_text};
+use pgrx::{Internal, IntoDatum, PgList, default, pg_extern, pg_guard, pg_sys};
 use std::borrow::Cow;
 use std::ffi::{CStr, c_void};
+use tinql::runtime::{Query, parse_tinql_to_query_default};
+use tokenizer::presets::default_pipeline;
 
-fn render_highlight(
-    text: Option<&str>,
-    begin_tag: &str,
-    end_tag: &str,
-    query: Option<&str>,
-) -> Option<String> {
-    let text = text?;
+fn render_highlight(text: &str, begin_tag: &str, end_tag: &str, query: Option<&Query>) -> String {
     // Without an explicit query or a tin index to bind one from, tin leaves
     // the text unmarked.
     let positions = query
-        .map(|query| positions_from_query(query, text))
+        .map(|query| query_positions(query, text))
         .unwrap_or_default();
     highlight_text(text, begin_tag, end_tag, &positions)
-        .map(Some)
         .unwrap_or_else(|error| pgrx::error!("{error}"))
 }
 
-fn render_highlight_ansi(
-    text: Option<&str>,
-    wrap_to: Option<i32>,
-    query: Option<&str>,
-) -> Option<String> {
-    let text = text?;
+fn render_highlight_ansi(text: &str, wrap_to: Option<i32>, query: Option<&Query>) -> String {
     let text = match wrap_to {
         Some(width) if width <= 0 => pgrx::error!("wrap_to must be positive"),
         Some(width) => Cow::Owned(rewrap_text(text, width as usize)),
         None => Cow::Borrowed(text),
     };
     let positions = query
-        .map(|query| positions_from_query(query, text.as_ref()))
+        .map(|query| query_positions(query, text.as_ref()))
         .unwrap_or_default();
     if positions.is_empty() {
-        return Some(text.into_owned());
+        return text.into_owned();
     }
-    highlight_text_ansi(text.as_ref(), &positions)
-        .map(Some)
-        .unwrap_or_else(|error| pgrx::error!("{error}"))
+    highlight_text_ansi(text.as_ref(), &positions).unwrap_or_else(|error| pgrx::error!("{error}"))
+}
+
+/// Parses an explicit highlight query. A query that does not parse marks
+/// nothing.
+fn explicit_query(query: Option<&str>) -> Option<Query> {
+    parse_tinql_to_query_default(query?).ok()
+}
+
+/// Combines the search texts that `highlight_support` bound. A NULL text
+/// matches no rows, so it marks nothing.
+fn bound_query(queries: Vec<Option<String>>) -> Option<Query> {
+    let texts = queries.into_iter().collect::<Option<Vec<_>>>()?;
+    Some(crate::operator::parse_searches(&texts, default_pipeline()))
 }
 
 #[pg_extern(name = "highlight", immutable, parallel_safe)]
@@ -65,7 +66,12 @@ fn highlight(
     end_tag: default!(&str, "'</b>'"),
     query: default!(Option<&str>, "NULL"),
 ) -> Option<String> {
-    render_highlight(text, begin_tag, end_tag, query)
+    Some(render_highlight(
+        text?,
+        begin_tag,
+        end_tag,
+        explicit_query(query).as_ref(),
+    ))
 }
 
 #[pg_extern(name = "highlight_ansi", immutable, parallel_safe)]
@@ -74,7 +80,42 @@ fn highlight_ansi(
     wrap_to: default!(Option<i32>, "NULL"),
     query: default!(Option<&str>, "NULL"),
 ) -> Option<String> {
-    render_highlight_ansi(text, wrap_to, query)
+    Some(render_highlight_ansi(
+        text?,
+        wrap_to,
+        explicit_query(query).as_ref(),
+    ))
+}
+
+/// `highlight` with the search texts of the quals `highlight_support` bound.
+#[pg_extern(immutable, parallel_safe)]
+fn highlight_bound(
+    text: Option<&str>,
+    begin_tag: &str,
+    end_tag: &str,
+    queries: Vec<Option<String>>,
+) -> Option<String> {
+    Some(render_highlight(
+        text?,
+        begin_tag,
+        end_tag,
+        bound_query(queries).as_ref(),
+    ))
+}
+
+/// `highlight_ansi` with the search texts of the quals `highlight_support`
+/// bound.
+#[pg_extern(immutable, parallel_safe)]
+fn highlight_ansi_bound(
+    text: Option<&str>,
+    wrap_to: Option<i32>,
+    queries: Vec<Option<String>>,
+) -> Option<String> {
+    Some(render_highlight_ansi(
+        text?,
+        wrap_to,
+        bound_query(queries).as_ref(),
+    ))
 }
 
 struct QueryContext {
@@ -119,75 +160,6 @@ fn unhandled() -> Internal {
     Internal::from(Some(pg_sys::Datum::from(0_usize)))
 }
 
-unsafe fn text_const(value: &str) -> *mut pg_sys::Node {
-    let datum = value.into_datum().expect("&str is never NULL");
-    unsafe {
-        pg_sys::makeConst(
-            pg_sys::TEXTOID,
-            -1,
-            pg_sys::DEFAULT_COLLATION_OID,
-            -1,
-            datum,
-            false,
-            false,
-        )
-        .cast()
-    }
-}
-
-unsafe fn concatenate(left: *mut pg_sys::Node, right: *mut pg_sys::Node) -> *mut pg_sys::Node {
-    let mut args = PgList::<pg_sys::Node>::new();
-    args.push(left);
-    args.push(right);
-    unsafe {
-        pg_sys::makeFuncExpr(
-            pg_sys::Oid::from(pg_sys::F_TEXTCAT),
-            pg_sys::TEXTOID,
-            args.into_pg(),
-            pg_sys::DEFAULT_COLLATION_OID,
-            pg_sys::DEFAULT_COLLATION_OID,
-            pg_sys::CoercionForm::COERCE_EXPLICIT_CALL,
-        )
-        .cast()
-    }
-}
-
-/// Combines the search expressions of every binding qual into one query.
-/// Constant expressions fold at plan time; parameters and other run-time
-/// expressions are concatenated by the plan instead of being dropped.
-unsafe fn combined_query(queries: &[*mut pg_sys::Node]) -> *mut pg_sys::Node {
-    if queries.len() < 2 {
-        return unsafe { pg_sys::copyObjectImpl(queries[0].cast()).cast() };
-    }
-    if let Some(text) = unsafe { constant_texts(queries) } {
-        return unsafe { text_const(&text.join(" OR ")) };
-    }
-    let mut combined = unsafe { text_const("(") };
-    for (position, &query) in queries.iter().enumerate() {
-        if position > 0 {
-            combined = unsafe { concatenate(combined, text_const(") OR (")) };
-        }
-        combined = unsafe { concatenate(combined, pg_sys::copyObjectImpl(query.cast()).cast()) };
-    }
-    unsafe { concatenate(combined, text_const(")")) }
-}
-
-unsafe fn constant_texts(queries: &[*mut pg_sys::Node]) -> Option<Vec<String>> {
-    let mut text = Vec::with_capacity(queries.len());
-    for &query in queries {
-        if query.is_null() || unsafe { (*query).type_ } != pg_sys::NodeTag::T_Const {
-            return None;
-        }
-        let value = unsafe { &*query.cast::<pg_sys::Const>() };
-        if value.constisnull || value.consttype != pg_sys::TEXTOID {
-            return None;
-        }
-        let value = unsafe { String::from_datum(value.constvalue, false) }?;
-        text.push(format!("({value})"));
-    }
-    Some(text)
-}
-
 #[pg_extern(immutable, parallel_unsafe)]
 fn highlight_support(request: Internal) -> Internal {
     let Some(datum) = request.into_datum() else {
@@ -207,10 +179,23 @@ fn highlight_support(request: Internal) -> Internal {
             return unhandled();
         }
         let name = CStr::from_ptr(function_name).to_bytes();
-        let query_position = if name == b"highlight" {
-            3
+        let (query_position, bound, types): (_, _, &[pg_sys::Oid]) = if name == b"highlight" {
+            (
+                3,
+                c"tin.highlight_bound",
+                &[
+                    pg_sys::TEXTOID,
+                    pg_sys::TEXTOID,
+                    pg_sys::TEXTOID,
+                    pg_sys::TEXTARRAYOID,
+                ],
+            )
         } else if name == b"highlight_ansi" {
-            2
+            (
+                2,
+                c"tin.highlight_ansi_bound",
+                &[pg_sys::TEXTOID, pg_sys::INT4OID, pg_sys::TEXTARRAYOID],
+            )
         } else {
             return unhandled();
         };
@@ -249,8 +234,15 @@ fn highlight_support(request: Internal) -> Internal {
         if binding.queries.is_empty() {
             return unhandled();
         }
-        let query = combined_query(&binding.queries);
+        // Each search text is parsed on its own when the plan runs, since
+        // parameters and other run-time expressions have no text until then.
+        let mut queries = PgList::<pg_sys::Node>::new();
+        for &query in &binding.queries {
+            queries.push(query);
+        }
+        let query = crate::score::make_text_array(queries);
         let replacement = pg_sys::copyObjectImpl(request.fcall.cast()).cast::<pg_sys::FuncExpr>();
+        (*replacement).funcid = crate::score::lookup_bound_function(bound, types);
         let mut args = PgList::<pg_sys::Node>::new();
         for position in 0..pg_sys::list_length((*request.fcall).args) {
             let argument = if position == query_position {
@@ -273,7 +265,13 @@ ALTER FUNCTION @extschema@.highlight_ansi(pg_catalog.text, pg_catalog.int4, pg_c
     SUPPORT @extschema@.highlight_support;
 "#,
     name = "highlight_support_bindings",
-    requires = [highlight, highlight_ansi, highlight_support]
+    requires = [
+        highlight,
+        highlight_ansi,
+        highlight_bound,
+        highlight_ansi_bound,
+        highlight_support
+    ]
 );
 
 #[cfg(feature = "pg_test")]
@@ -304,6 +302,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(marked, "<b>alpha</b> <b>zeta</b> filler");
+    }
+
+    #[pg_test]
+    fn several_searches_highlight_like_one_ored_search() {
+        create_highlight_table();
+        let highlight = |function: &str, quals: &str| {
+            pgrx::Spi::get_one::<String>(&format!(
+                "SELECT tin.{function}(title) FROM lite_highlight_quals WHERE {quals}"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        for (separate, ored, expected) in [
+            (
+                "title ==> 'alpha' OR title ==> '\"zeta filler\"'",
+                "title ==> '(alpha) OR (\"zeta filler\")'",
+                "<b>alpha</b> <b>zeta filler</b>",
+            ),
+            // An empty search matches nothing and leaves the others to mark.
+            (
+                "title ==> 'zeta' OR title ==> ''",
+                "title ==> 'zeta'",
+                "alpha <b>zeta</b> filler",
+            ),
+        ] {
+            assert_eq!(highlight("highlight", separate), expected);
+            assert_eq!(highlight("highlight", ored), expected);
+            assert_eq!(
+                highlight("highlight_ansi", separate),
+                highlight("highlight_ansi", ored)
+            );
+        }
     }
 
     #[pg_test]
@@ -369,10 +399,10 @@ mod tests {
     #[pg_test]
     fn explicit_html_and_ansi_highlighting_render_matches() {
         assert_eq!(
-            render_highlight(Some("Hi there"), "<b>", "</b>", Some("hi")),
+            highlight(Some("Hi there"), "<b>", "</b>", Some("hi")),
             Some("<b>Hi</b> there".into())
         );
-        let ansi = render_highlight_ansi(Some("hi there"), None, Some("hi")).unwrap();
+        let ansi = highlight_ansi(Some("hi there"), None, Some("hi")).unwrap();
         assert!(ansi.contains("\x1b["));
         assert!(ansi.contains("hi"));
     }

@@ -313,6 +313,53 @@ mod tests {
     }
 
     #[pg_test]
+    fn several_searches_score_like_one_ored_search() {
+        Spi::run(
+            "CREATE TABLE lite_ored (id int, body text);
+             INSERT INTO lite_ored VALUES
+               (1, 'beer wine'), (2, 'beer beer ale'), (3, 'wine cellar'),
+               (4, 'craft beer bar'), (5, 'water');
+             CREATE INDEX ON lite_ored USING tin (body);",
+        )
+        .unwrap();
+        let scores = |function: &str, quals: &str| {
+            Spi::get_one::<Vec<f32>>(&format!(
+                "SELECT array_agg(tin.{function}(ctid) ORDER BY id) FROM lite_ored WHERE {quals}"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        for (separate, ored) in [
+            (
+                "body ==> 'beer' OR body ==> 'wine'",
+                "body ==> '(beer) OR (wine)'",
+            ),
+            (
+                "body ==> 'beer^2 OR ale' OR body ==> '\"craft beer\"'
+                   OR body ==> 'wine~1 cellar'",
+                "body ==> '(beer^2 OR ale) OR (\"craft beer\") OR (wine~1 cellar)'",
+            ),
+            // An empty search matches nothing and leaves the others to score.
+            ("body ==> 'beer' OR body ==> ''", "body ==> 'beer'"),
+        ] {
+            for function in ["score", "full_score", "max_score"] {
+                let (separate, ored) = (scores(function, separate), scores(function, ored));
+                if function == "full_score" {
+                    assert!(separate.iter().all(|score| *score > 0.0), "{separate:?}");
+                }
+                assert_eq!(
+                    separate
+                        .iter()
+                        .map(|score| score.to_bits())
+                        .collect::<Vec<_>>(),
+                    ored.iter().map(|score| score.to_bits()).collect::<Vec<_>>(),
+                    "{function}: {separate:?} / {ored:?}"
+                );
+            }
+        }
+    }
+
+    #[pg_test]
     fn scoring_binds_search_text_from_another_relation_per_row() {
         Spi::run(
             "CREATE TABLE lite_join_docs (id int, body text);
@@ -882,6 +929,52 @@ mod session_tests {
         writer
             .batch_execute("DROP TABLE lead_cursor_probe")
             .unwrap();
+    }
+
+    #[test]
+    fn malformed_searches_fail_like_the_operator() {
+        let mut client = session();
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE lead_malformed (id integer, body text);
+                 INSERT INTO lead_malformed VALUES (1, 'beer a b'), (2, 'beer foo or bar');
+                 CREATE INDEX ON lead_malformed USING tin (body);",
+            )
+            .unwrap();
+        let mut message = |sql: &str| {
+            let error = client.query(sql, &[]).unwrap_err();
+            let error = error
+                .as_db_error()
+                .unwrap_or_else(|| panic!("{sql}: {error}"));
+            error.message().to_owned()
+        };
+        // Every row matches 'beer', so the malformed quals after it never run.
+        // Each text is invalid on its own but valid once wrapped in parentheses
+        // and joined with the others.
+        for searches in [
+            &["a) OR (b"][..],
+            &["\"foo\\", "bar\""],
+            &["beer AND (wine", "ale)"],
+            &["MATCHES fo(o", "bar)"],
+        ] {
+            let operator = message(&format!("SELECT 'beer' ==> '{}'", searches[0]));
+            assert!(operator.starts_with("invalid ==> query: "), "{operator}");
+            let quals = searches
+                .iter()
+                .map(|search| format!(" OR body ==> '{search}'"))
+                .collect::<String>();
+            for function in [
+                "tin.score(ctid)",
+                "tin.full_score(ctid)",
+                "tin.max_score(ctid)",
+                "tin.highlight(body)",
+                "tin.highlight_ansi(body)",
+            ] {
+                let sql =
+                    format!("SELECT {function} FROM lead_malformed WHERE body ==> 'beer'{quals}");
+                assert_eq!(message(&sql), operator, "{sql}");
+            }
+        }
     }
 
     #[test]
