@@ -667,32 +667,10 @@ unsafe extern "C-unwind" fn find_qual(node: *mut pg_sys::Node, context: *mut c_v
         return false;
     }
     let binding = unsafe { &mut *context.cast::<QualBinding>() };
-    if let Some(search) = unsafe { search_operands(node) } {
+    if let Some(search) = unsafe { crate::operator::search_operands(node) } {
         binding.matches.push(search);
     }
     unsafe { pg_sys::expression_tree_walker(node, Some(find_qual), context) }
-}
-
-/// Returns the document and query operands of a `==>` search.
-unsafe fn search_operands(
-    node: *mut pg_sys::Node,
-) -> Option<(*mut pg_sys::Node, *mut pg_sys::Node)> {
-    unsafe {
-        if (*node).type_ != pg_sys::NodeTag::T_OpExpr {
-            return None;
-        }
-        let op = node.cast::<pg_sys::OpExpr>();
-        let name = pg_sys::get_opname((*op).opno);
-        if name.is_null()
-            || CStr::from_ptr(name).to_bytes() != b"==>"
-            || pg_sys::list_length((*op).args) != 2
-        {
-            return None;
-        }
-        let left = pg_sys::list_nth((*op).args, 0).cast::<pg_sys::Node>();
-        let right = pg_sys::list_nth((*op).args, 1).cast::<pg_sys::Node>();
-        (!left.is_null()).then_some((left, right))
-    }
 }
 
 struct VarnoBinding {
@@ -1077,7 +1055,7 @@ unsafe fn search_index(
     node: *mut pg_sys::Node,
 ) -> Option<Option<pg_sys::Oid>> {
     unsafe {
-        let (document, _) = search_operands(node)?;
+        let (document, _) = crate::operator::search_operands(node)?;
         (single_varno(document) == Some(varno))
             .then(|| find_matching_tin_index(parse, (*rte).relid, varno, document))
     }

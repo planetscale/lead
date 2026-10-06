@@ -757,14 +757,15 @@ mod tests {
         )
         .unwrap();
         let full = "SELECT array_agg(tin.full_score(ctid) ORDER BY id) FROM lite_fields WHERE";
-        // tin scores each row by the one column it matches, in either order.
+        // tin scores each row by the one column it matches, in either order:
+        // 0.87138504 and 0.6931472, which is ln 2.
         for quals in [
             "title ==> 'ruby' OR body ==> 'ruby'",
             "body ==> 'ruby' OR title ==> 'ruby'",
         ] {
             assert_eq!(
                 scores_by_id(&format!("{full} {quals}")),
-                [0.871_385_04, 0.693_147_2],
+                [0.871_385_04, std::f32::consts::LN_2],
                 "{quals}"
             );
         }
@@ -907,6 +908,46 @@ mod tests {
              WHERE title ==> 'ruby' OR body ==> 'ruby'",
         )
         .unwrap();
+    }
+
+    #[pg_test]
+    fn other_search_operators_do_not_bind_scoring_or_highlighting() {
+        Spi::run(
+            "CREATE TABLE lite_other_operator (id int, body text);
+             INSERT INTO lite_other_operator VALUES (1, 'beer wine'), (2, 'beer'), (3, 'cider');
+             CREATE INDEX ON lite_other_operator USING tin (body);
+             CREATE SCHEMA lite_other;
+             CREATE FUNCTION lite_other.longer_than(text, int) RETURNS boolean
+               LANGUAGE sql IMMUTABLE AS 'SELECT length($1) > $2';
+             CREATE OPERATOR lite_other.==> (
+               LEFTARG = text, RIGHTARG = int, FUNCTION = lite_other.longer_than);",
+        )
+        .unwrap();
+        let rows = |select: &str, quals: &str| {
+            Spi::get_one::<Vec<String>>(&format!(
+                "SELECT array_agg(({select})::text ORDER BY id)
+                 FROM lite_other_operator WHERE {quals}"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        let other = "body OPERATOR(lite_other.==>) 3";
+        for select in [
+            "tin.score(ctid)",
+            "tin.full_score(ctid)",
+            "tin.max_score(ctid)",
+            "tin.highlight(body)",
+        ] {
+            assert_eq!(
+                rows(select, &format!("body ==> 'beer' AND {other}")),
+                rows(select, "body ==> 'beer'"),
+                "{select}"
+            );
+        }
+        assert_eq!(
+            rows("tin.highlight(body)", other),
+            ["beer wine", "beer", "cider"]
+        );
     }
 
     #[pg_test]
