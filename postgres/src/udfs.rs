@@ -187,8 +187,7 @@ pub fn ql_parse(
         graphemes,
         position_gaps,
     });
-    let parsed =
-        tinql::parse(query, tinql::ImplicitOp::And).unwrap_or_else(|error| pgrx::error!("{error}"));
+    let parsed = crate::tinql::parse(query).unwrap_or_else(|error| pgrx::error!("{error}"));
     let analyzed = tinql::runtime::subtokenize::sub_tokenize(parsed, &pipeline)
         .unwrap_or_else(|error| pgrx::error!("{error}"));
     if surface {

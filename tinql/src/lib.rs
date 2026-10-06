@@ -55,3 +55,81 @@ pub fn parse(input: &str, implicit_op: ImplicitOp) -> Result<Expr, ParseError> {
     }
     parser::pest_parser::parse(input, implicit_op)
 }
+
+/// The deepest `(`/`[` nesting reached in `input`, counting grouping and
+/// alternatives but not the atomic contents of a double-quoted phrase (a
+/// `\` there escapes the next character). The grammar recurses one level per
+/// enclosing bracket, so this bounds the parser's recursion depth from above,
+/// and since each level opens a bracket it never exceeds `input.len()`. An
+/// unmatched closer floors the running depth at zero rather than going
+/// negative, so the result is an upper bound on any valid parse's depth and a
+/// cheap pre-parse guard against stack-overflowing deeply nested input.
+pub fn max_bracket_depth(input: &str) -> usize {
+    let mut depth: usize = 0;
+    let mut max: usize = 0;
+    let mut in_phrase = false;
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if in_phrase {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_phrase = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                '"' => in_phrase = true,
+                '(' | '[' => {
+                    depth += 1;
+                    max = max.max(depth);
+                }
+                ')' | ']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    max
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::max_bracket_depth;
+
+    #[test]
+    fn counts_nested_grouping_and_alternatives() {
+        assert_eq!(max_bracket_depth(""), 0);
+        assert_eq!(max_bracket_depth("beer"), 0);
+        assert_eq!(max_bracket_depth("(beer OR wine)"), 1);
+        assert_eq!(max_bracket_depth("((a))"), 2);
+        assert_eq!(max_bracket_depth("[a [b [c]]]"), 3);
+        // Mixed brackets nest together.
+        assert_eq!(max_bracket_depth("([a])"), 2);
+        // The deepest point wins, not the last.
+        assert_eq!(max_bracket_depth("((a)) (b)"), 2);
+    }
+
+    #[test]
+    fn ignores_brackets_inside_a_phrase() {
+        assert_eq!(max_bracket_depth("\"[[[[\""), 0);
+        // An escaped quote stays inside the phrase; the trailing group counts.
+        assert_eq!(max_bracket_depth("\"a \\\" b\" (c)"), 1);
+        // An unterminated phrase swallows the rest, so nothing after counts.
+        assert_eq!(max_bracket_depth("(a) \"[[["), 1);
+    }
+
+    #[test]
+    fn unmatched_closers_floor_at_zero() {
+        assert_eq!(max_bracket_depth(")))"), 0);
+        assert_eq!(max_bracket_depth("a) (b"), 1);
+        assert_eq!(max_bracket_depth("((("), 3);
+    }
+
+    #[test]
+    fn depth_never_exceeds_length() {
+        for q in ["", "beer", "(((x)))", "[a, b, c]", "\"[[[\" (())"] {
+            assert!(max_bracket_depth(q) <= q.len());
+        }
+    }
+}

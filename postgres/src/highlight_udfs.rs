@@ -15,10 +15,11 @@
 //
 // The full license text is available in LICENSE.
 use crate::highlight::{highlight_text, highlight_text_ansi, query_positions, rewrap_text};
+use crate::tinql::parse_tinql_to_query_default;
 use pgrx::{Internal, IntoDatum, PgList, default, pg_extern, pg_guard, pg_sys};
 use std::borrow::Cow;
 use std::ffi::{CStr, c_void};
-use tinql::runtime::{Query, parse_tinql_to_query_default};
+use tinql::runtime::Query;
 use tokenizer::presets::default_pipeline;
 
 fn render_highlight(text: &str, begin_tag: &str, end_tag: &str, query: Option<&Query>) -> String {

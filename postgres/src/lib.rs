@@ -27,6 +27,7 @@ mod operator;
 pub(crate) mod options;
 mod score;
 mod tf_bucket;
+mod tinql;
 mod udfs;
 
 #[pg_guard]
@@ -1287,6 +1288,155 @@ mod session_tests {
                     format!("SELECT {function} FROM lead_malformed WHERE body ==> 'beer'{quals}");
                 assert_eq!(message(&sql), operator, "{sql}");
             }
+        }
+    }
+
+    #[test]
+    fn overlong_and_overnested_queries_fail_every_parse_like_tin() {
+        let mut client = session();
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE lead_query_limits (id integer, body text);
+                 INSERT INTO lead_query_limits VALUES
+                   (1, 'alpha beta'), (2, 'beta gamma'), (3, 'delta');
+                 CREATE INDEX lead_query_limits_idx ON lead_query_limits USING tin (body);",
+            )
+            .unwrap();
+        // at: 2048 bytes. over: 2049 bytes. wide: 1028 characters, 2050 bytes.
+        // nested(8) and nested(64) stay within the 64-level depth limit;
+        // nested(65) is one level past it and well under the byte limit, so
+        // depth is what rejects it.
+        let at = format!("{:<2047})", "alpha OR (gamma");
+        let over = format!("{:<2048})", "alpha OR (gamma");
+        let wide = format!("alpha {}", "é".repeat(1022));
+        let nested = |depth: usize| format!("{}delta{}", "(".repeat(depth), ")".repeat(depth));
+        let deep = nested(65);
+        assert_eq!(
+            (
+                at.len(),
+                over.len(),
+                wide.chars().count(),
+                wide.len(),
+                deep.len()
+            ),
+            (2048, 2049, 1028, 2050, 135)
+        );
+
+        let search = "SELECT id FROM lead_query_limits WHERE body ==> $1 ORDER BY id";
+        let ids = |client: &mut postgres::Client, query: &str| {
+            client
+                .query(search, &[&query])
+                .unwrap()
+                .iter()
+                .map(|row| row.get::<_, i32>(0))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&mut client, &at), [1, 2]);
+        assert_eq!(ids(&mut client, &nested(8)), [3]);
+        assert_eq!(ids(&mut client, &nested(64)), [3]);
+        let row = client
+            .query_one(
+                "SELECT tin.ql_parse($1), tin.ql_parse($1, false),
+                        tin.highlight('alpha beta gamma', query => $1),
+                        (SELECT count(*) FROM tin.score_inspect('lead_query_limits_idx', $1, 1.0)),
+                        (SELECT count(tin.score(ctid)) FROM lead_query_limits
+                         WHERE body ==> $1)",
+                &[&at],
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, i64>(3),
+                row.get::<_, i64>(4),
+            ),
+            (
+                "alpha OR gamma".into(),
+                "OR(alpha, gamma)".into(),
+                "<b>alpha</b> beta <b>gamma</b>".into(),
+                2,
+                2
+            )
+        );
+
+        // Every row matches the first search, so only the scoring and
+        // highlighting binds parse the second.
+        let bound = "FROM lead_query_limits
+                     WHERE body ==> 'alpha OR beta OR delta' OR body ==> $1";
+        let entry_points = [
+            search.to_owned(),
+            "SELECT 'alpha beta' ==> $1".to_owned(),
+            "SELECT tin.ql_parse($1)".to_owned(),
+            "SELECT tin.ql_parse($1, false)".to_owned(),
+            "SELECT tin.highlight('alpha beta gamma', query => $1)".to_owned(),
+            "SELECT * FROM tin.score_inspect('lead_query_limits_idx', $1)".to_owned(),
+            format!("SELECT tin.score(ctid) {bound}"),
+            format!("SELECT tin.full_score(ctid) {bound}"),
+            format!("SELECT tin.max_score(ctid) {bound}"),
+            format!("SELECT tin.highlight(body) {bound}"),
+            format!("SELECT tin.highlight_ansi(body) {bound}"),
+        ];
+        let too_long = |bytes: usize| {
+            (
+                "54000".to_owned(),
+                "tinql query is too long".to_owned(),
+                Some(format!(
+                    "The query is {bytes} bytes; the limit is 2048 bytes."
+                )),
+            )
+        };
+        let too_deep = (
+            "54000".to_owned(),
+            "tinql query is nested too deeply".to_owned(),
+            Some("The query nests 65 levels deep; the limit is 64.".to_owned()),
+        );
+        for (query, expected) in [
+            (&over, too_long(2049)),
+            (&wide, too_long(2050)),
+            (&deep, too_deep),
+        ] {
+            for sql in &entry_points {
+                let error = client.query(sql.as_str(), &[query]).unwrap_err();
+                let error = error
+                    .as_db_error()
+                    .unwrap_or_else(|| panic!("{sql}: {error}"));
+                assert_eq!(
+                    (
+                        error.code().code().to_owned(),
+                        error.message().to_owned(),
+                        error.detail().map(str::to_owned)
+                    ),
+                    expected,
+                    "{sql}"
+                );
+            }
+        }
+
+        client
+            .batch_execute(
+                "SET plan_cache_mode = force_generic_plan;
+                 PREPARE lead_query_limit_search(text) AS
+                   SELECT id FROM lead_query_limits WHERE body ==> $1 ORDER BY id;",
+            )
+            .unwrap();
+        let mut execute =
+            |query: &str| client.query(&format!("EXECUTE lead_query_limit_search('{query}')"), &[]);
+        let rows = execute(&at).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.get::<_, i32>(0))
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        for query in [&over, &deep] {
+            let error = execute(query).unwrap_err();
+            assert_eq!(
+                error.code().map(|code| code.code()),
+                Some("54000"),
+                "{error}"
+            );
         }
     }
 
