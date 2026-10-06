@@ -25,7 +25,7 @@ use tokenizer::Tokenizer;
 use tokenizer::presets::default_pipeline;
 
 fn parse_search<T: Tokenizer>(query_text: &str, tokenizer: &T) -> Result<Query, String> {
-    let parsed = tinql::parse(query_text, tinql::ImplicitOp::And).map_err(|e| e.to_string())?;
+    let parsed = crate::tinql::parse(query_text).map_err(|e| e.to_string())?;
     let analyzed = sub_tokenize(parsed, tokenizer).map_err(|e| e.to_string())?;
     lower(&analyzed).map_err(|e| e.to_string())
 }

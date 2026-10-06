@@ -18,6 +18,7 @@ use crate::bm25::{
     Bm25Overrides, DenseRatio, ScoreStopWords, ScoringTermInput, TermScorer, TermSetEdit,
     compile_scoring_terms, sum_scores_in_order,
 };
+use crate::tinql::parse_tinql_to_query;
 use pgrx::iter::TableIterator;
 use pgrx::{
     FromDatum, Internal, IntoDatum, PgBox, PgList, PgMemoryContexts, PgRelation, Spi, default,
@@ -25,7 +26,7 @@ use pgrx::{
 };
 use rustc_hash::FxHashMap;
 use std::ffi::{CStr, CString, c_void};
-use tinql::runtime::{Query, SpanTermSlot, evaluate, parse_tinql_to_query, tokenize_doc};
+use tinql::runtime::{Query, SpanTermSlot, evaluate, tokenize_doc};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
 /// Which scorer `score_support` rewrote into `score_bound`. It crosses the SQL
