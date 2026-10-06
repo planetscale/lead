@@ -28,6 +28,45 @@ use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::{Query, SpanTermSlot, evaluate, parse_tinql_to_query, tokenize_doc};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
+/// Which scorer `score_support` rewrote into `score_bound`. It crosses the SQL
+/// boundary as the `int4` mode argument.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(i32)]
+enum ScoreMode {
+    /// `tin.score`: dense-ratio elision and score stop words apply.
+    Score = 0,
+    /// `tin.full_score`: every query term scores.
+    FullScore = 1,
+    /// `tin.max_score` under the `tin.score` policy.
+    MaxScore = 2,
+    /// `tin.max_score` in a query that also calls `tin.full_score`.
+    MaxFullScore = 3,
+}
+
+impl ScoreMode {
+    fn is_full(self) -> bool {
+        matches!(self, Self::FullScore | Self::MaxFullScore)
+    }
+
+    fn is_max(self) -> bool {
+        matches!(self, Self::MaxScore | Self::MaxFullScore)
+    }
+}
+
+impl TryFrom<i32> for ScoreMode {
+    type Error = i32;
+
+    fn try_from(mode: i32) -> Result<Self, i32> {
+        match mode {
+            0 => Ok(Self::Score),
+            1 => Ok(Self::FullScore),
+            2 => Ok(Self::MaxScore),
+            3 => Ok(Self::MaxFullScore),
+            _ => Err(mode),
+        }
+    }
+}
+
 /// Identifies one search that a `score_bound` call site scores rows against.
 /// The search text can vary per row, as in `t.body ==> q.text` driven by a
 /// join, so a call site may hold several of these.
@@ -36,7 +75,7 @@ struct CorpusKey {
     heap_oid: u32,
     index_oid: u32,
     query: String,
-    mode: i32,
+    mode: ScoreMode,
     dense: u32,
     k1: Option<u32>,
     b: Option<u32>,
@@ -122,6 +161,8 @@ fn score_bound(
     term_replace: Option<Vec<String>>,
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> f32 {
+    let mode = ScoreMode::try_from(mode)
+        .unwrap_or_else(|mode| pgrx::error!("tin.score_bound(): unknown score mode {mode}"));
     let mut parts = Vec::with_capacity(query.len());
     for part in query {
         // A NULL search expression matches no rows, so nothing needs a score.
@@ -143,7 +184,7 @@ fn score_bound(
     let corpus = memo
         .entry(key)
         .or_insert_with_key(|key| build_corpus(key, k1, b, term_add, term_replace));
-    if mode == 2 || mode == 3 {
+    if mode.is_max() {
         corpus.max
     } else {
         corpus.score(document)
@@ -173,7 +214,7 @@ fn build_corpus(
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
 ) -> ScoreCorpus {
-    let full = key.mode == 1 || key.mode == 3;
+    let full = key.mode.is_full();
     let heap_oid = pg_sys::Oid::from(key.heap_oid);
     let index = unsafe {
         PgRelation::with_lock(
@@ -237,7 +278,7 @@ fn build_corpus(
         scorers.push((term.text().to_owned(), scorer));
     }
     let mut max = 0.0_f32;
-    if key.mode == 2 || key.mode == 3 {
+    if key.mode.is_max() {
         for (document, tokens) in documents.iter().zip(&tokenized) {
             let matched = evaluate(&query, &tokenize_doc(document, &tokenizer))
                 .unwrap_or_else(|error| pgrx::error!("tin score query evaluation failed: {error}"))
@@ -638,7 +679,7 @@ unsafe extern "C-unwind" fn has_full_score(node: *mut pg_sys::Node, context: *mu
             if function.funcid == binding.bound {
                 let mode = pg_sys::list_nth(function.args, 4).cast::<pg_sys::Const>();
                 if (*mode).xpr.type_ == pg_sys::NodeTag::T_Const
-                    && (*mode).constvalue.value() == 1
+                    && (*mode).constvalue.value() == ScoreMode::FullScore as usize
                     && pg_sys::equal(pg_sys::list_nth(function.args, 0), binding.document.cast())
                 {
                     return true;
@@ -717,7 +758,7 @@ fn score_support(request: Internal) -> Internal {
         let function_name = pg_sys::get_func_name((*request.fcall).funcid);
         let fname = CStr::from_ptr(function_name).to_string_lossy();
         let mode = if fname.as_ref() == "full_score" {
-            1
+            ScoreMode::FullScore
         } else if fname.as_ref() == "max_score" {
             let mut binding = FullScoreBinding {
                 ctid,
@@ -731,9 +772,13 @@ fn score_support(request: Internal) -> Internal {
                 (&mut binding as *mut FullScoreBinding).cast(),
                 pg_sys::QTW_IGNORE_RC_SUBQUERIES as i32,
             );
-            if full { 3 } else { 2 }
+            if full {
+                ScoreMode::MaxFullScore
+            } else {
+                ScoreMode::MaxScore
+            }
         } else {
-            0
+            ScoreMode::Score
         };
         let mut args = PgList::<pg_sys::Node>::new();
         args.push(pg_sys::copyObjectImpl(document.cast()).cast());
@@ -746,10 +791,10 @@ fn score_support(request: Internal) -> Internal {
         args.push(make_query_array(&same_expression, first_query));
         args.push(make_int4_const((*rte).relid.to_u32() as i32).cast());
         args.push(make_int4_const(index_oid.to_u32() as i32).cast());
-        args.push(make_int4_const(mode).cast());
+        args.push(make_int4_const(mode as i32).cast());
         let null_float = || make_null_const(pg_sys::FLOAT4OID);
         let null_array = || make_null_const(pg_sys::TEXTARRAYOID);
-        if mode == 0 {
+        if mode == ScoreMode::Score {
             for position in 1..=5 {
                 args.push(
                     pg_sys::copyObjectImpl(
@@ -760,7 +805,7 @@ fn score_support(request: Internal) -> Internal {
             }
         } else {
             args.push(null_float().cast());
-            if mode == 1 && original_nargs == 3 {
+            if mode == ScoreMode::FullScore && original_nargs == 3 {
                 args.push(
                     pg_sys::copyObjectImpl(pg_sys::list_nth((*request.fcall).args, 1).cast())
                         .cast(),
