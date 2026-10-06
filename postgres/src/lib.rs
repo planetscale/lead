@@ -980,12 +980,17 @@ mod tests {
             max(", max(tin.score(ctid, 0.05))", "body ==> 'ruby'"),
             Some(0.0)
         );
-        // tin computes no maximum under the score policy for several scans.
+        // Several scans report the summed maximum under either policy.
         for quals in [
             "title ==> 'gems' OR body ==> 'ruby'",
             "body ==> 'ruby' OR id = 5",
         ] {
-            assert_eq!(max(", max(tin.score(ctid))", quals), None, "{quals}");
+            let score = Spi::get_one::<f32>(&format!(
+                "SELECT max(tin.score(ctid)) FROM lite_max_policy WHERE {quals}"
+            ))
+            .unwrap();
+            assert!(score.is_some_and(|score| score > 0.0), "{quals}");
+            assert_eq!(max(", max(tin.score(ctid))", quals), score, "{quals}");
             assert!(max("", quals).is_some_and(|max| max > 0.0), "{quals}");
         }
         assert!(
@@ -995,6 +1000,74 @@ mod tests {
             )
             .is_some_and(|max| max > 0.0)
         );
+    }
+
+    #[pg_test]
+    fn max_score_reports_the_in_use_scorers_maximum_on_every_shape() {
+        Spi::run(
+            "CREATE TABLE lite_max_shapes (id int PRIMARY KEY, title text, body text);
+             INSERT INTO lite_max_shapes
+             SELECT g,
+                    CASE WHEN g IN (1, 2) THEN 'zebra word' WHEN g = 3 THEN 'common'
+                         ELSE 'filler ' || g END,
+                    CASE WHEN g IN (2, 5) THEN 'zebra zebra text' WHEN g = 6 THEN 'common'
+                         ELSE 'padding ' || g END
+             FROM generate_series(1, 40) AS g;
+             CREATE INDEX ON lite_max_shapes USING tin (title);
+             CREATE INDEX ON lite_max_shapes USING tin (body);",
+        )
+        .unwrap();
+        // Each maximum is the highest score of the in-use scoring function
+        // over the rows the quals admit. tin's expected values: 2.7828705
+        // (title) + 3.3875334 (body) for row 2, which matches both. Lead
+        // scores a row by every search it matches, not by the arm that
+        // admits it, so the split-arm OR is checked against the control only.
+        let both = 6.170_404;
+        let body = 3.387_533_4;
+        for (quals, expected) in [
+            ("title ==> 'zebra' OR body ==> 'zebra'", Some(both)),
+            ("title ==> 'zebra' AND body ==> 'zebra'", Some(both)),
+            ("body ==> 'zebra' OR id = 1", Some(body)),
+            ("(body ==> 'zebra' OR id = 1) AND id < 10", Some(body)),
+            ("(title ==> 'zebra' AND id < 2) OR body ==> 'zebra'", None),
+            (
+                "(title ==> 'zebra' OR id = 3) AND body ==> 'zebra'",
+                Some(both),
+            ),
+        ] {
+            // Without a scoring function, max_score follows tin.full_score.
+            let policies = [
+                ("tin.score(ctid)", true),
+                ("tin.score(ctid, 0.04)", true),
+                ("tin.full_score(ctid)", true),
+                ("tin.full_score(ctid)", false),
+            ];
+            for (scorer, beside) in policies {
+                let control = Spi::get_one::<f32>(&format!(
+                    "SELECT max(s) FROM (SELECT {scorer} AS s FROM lite_max_shapes
+                     WHERE {quals}) AS scored"
+                ))
+                .unwrap();
+                // The aggregate over the scorer keeps it in the query.
+                let scored = if beside {
+                    format!("max({scorer})")
+                } else {
+                    "NULL::real".into()
+                };
+                let (low, high) = Spi::get_three::<f32, f32, f32>(&format!(
+                    "SELECT min(tin.max_score(ctid)), max(tin.max_score(ctid)), {scored}
+                     FROM lite_max_shapes WHERE {quals}"
+                ))
+                .map(|(low, high, _)| (low, high))
+                .unwrap();
+                let context = format!("{scorer} beside={beside}: {quals}");
+                assert!(control.is_some(), "{context}");
+                assert_eq!((low, high), (control, control), "{context}");
+                if scorer != "tin.score(ctid, 0.04)" && expected.is_some() {
+                    assert_eq!(control, expected, "{context}");
+                }
+            }
+        }
     }
 
     #[pg_test(
