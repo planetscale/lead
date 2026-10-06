@@ -204,7 +204,7 @@ fn score_bound(
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
     fcinfo: pg_sys::FunctionCallInfo,
-) -> f32 {
+) -> Option<f32> {
     let mode = ScoreMode::try_from(mode)
         .unwrap_or_else(|mode| pgrx::error!("tin.score_bound(): unknown score mode {mode}"));
     let mut groups = index_oids
@@ -242,15 +242,12 @@ fn score_bound(
         .entry(key)
         .or_insert_with_key(|key| build_corpus(key, k1, b, term_add, term_replace));
     if mode.is_max() {
-        corpus.max
-    } else {
-        sum_group_scores(
-            corpus
-                .group_scores(&documents)
-                .into_iter()
-                .map(|(_, score)| score),
-        )
+        return Some(corpus.max);
     }
+    // Like tin, a row that no search admits, only another qual such as the
+    // `id = 8` of `body ==> 'beer' OR id = 8`, has no score.
+    let scores = corpus.group_scores(&documents);
+    (!scores.is_empty()).then(|| sum_group_scores(scores.into_iter().map(|(_, score)| score)))
 }
 
 /// Returns the corpora memoized on this call site's `FmgrInfo`. The executor

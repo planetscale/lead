@@ -911,6 +911,44 @@ mod tests {
     }
 
     #[pg_test]
+    fn rows_that_no_search_admits_have_no_score() {
+        Spi::run(
+            "CREATE TABLE lite_unsearched (id int, body text, active boolean);
+             INSERT INTO lite_unsearched VALUES
+               (1, 'gems', false), (2, 'gems gems', false),
+               (3, 'words', true), (4, 'other words', false);
+             CREATE INDEX ON lite_unsearched USING tin (body);",
+        )
+        .unwrap();
+        let scores = |select: &str, quals: &str| {
+            Spi::get_one::<Vec<Option<f32>>>(&format!(
+                "SELECT {select} FROM lite_unsearched WHERE {quals}"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        // The scores tin returns: the row only `id = 4` or `active` admits
+        // has none, and max_score still reports the searched maximum.
+        for quals in ["body ==> 'gems' OR id = 4", "body ==> 'gems' OR active"] {
+            let max = Some(0.871_385_04);
+            assert_eq!(
+                scores(
+                    "array_agg(tin.full_score(ctid) ORDER BY id)
+                     || array_agg(tin.max_score(ctid) ORDER BY id)",
+                    quals
+                ),
+                [Some(0.802_591_5), max, None, max, max, max],
+                "{quals}"
+            );
+            assert_eq!(
+                scores("array_agg(tin.score(ctid) ORDER BY id)", quals),
+                [Some(0.0), Some(0.0), None],
+                "{quals}"
+            );
+        }
+    }
+
+    #[pg_test]
     fn other_search_operators_do_not_bind_scoring_or_highlighting() {
         Spi::run(
             "CREATE TABLE lite_other_operator (id int, body text);
