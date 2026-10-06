@@ -125,30 +125,32 @@ CREATE OPERATOR CLASS @extschema@.tin_text_ops DEFAULT FOR TYPE pg_catalog.text 
     requires = [amhandler, tin_text_cmpfunc]
 );
 
-#[cfg(test)]
+#[cfg(feature = "pg_test")]
+#[pgrx::pg_schema]
 mod tests {
     use super::evaluate_text;
+    use pgrx::pg_test;
 
-    #[test]
+    #[pg_test]
     fn boolean_and_positional_queries_are_exact() {
         assert!(evaluate_text("A craft beer bar", "craft AND beer").unwrap());
         assert!(evaluate_text("A craft beer bar", "\"craft beer\"").unwrap());
         assert!(!evaluate_text("Beer for craft fans", "\"craft beer\"").unwrap());
     }
 
-    #[test]
+    #[pg_test]
     fn expansions_use_the_document_term_universe() {
         assert!(evaluate_text("brewhouse", "brew*").unwrap());
         assert!(evaluate_text("jalapeno", "jalapeño~1").unwrap());
         assert!(!evaluate_text("winery", "brew*").unwrap());
     }
 
-    #[test]
+    #[pg_test]
     fn empty_documents_do_not_match_match_all() {
         assert!(!evaluate_text("...", "*").unwrap());
     }
 
-    #[test]
+    #[pg_test]
     fn invalid_queries_are_reported() {
         assert!(evaluate_text("beer", "beer OR").is_err());
     }
