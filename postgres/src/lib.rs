@@ -748,6 +748,168 @@ mod tests {
     }
 
     #[pg_test]
+    fn scores_across_indexed_columns_do_not_depend_on_predicate_order() {
+        Spi::run(
+            "CREATE TABLE lite_fields (id int, title text, body text);
+             INSERT INTO lite_fields VALUES (1, 'quiet', 'ruby ruby'), (2, 'ruby', 'quiet');
+             CREATE INDEX ON lite_fields USING tin (title);
+             CREATE INDEX ON lite_fields USING tin (body);",
+        )
+        .unwrap();
+        let full = "SELECT array_agg(tin.full_score(ctid) ORDER BY id) FROM lite_fields WHERE";
+        // tin scores each row by the one column it matches, in either order.
+        for quals in [
+            "title ==> 'ruby' OR body ==> 'ruby'",
+            "body ==> 'ruby' OR title ==> 'ruby'",
+        ] {
+            assert_eq!(
+                scores_by_id(&format!("{full} {quals}")),
+                [0.871_385_04, 0.693_147_2],
+                "{quals}"
+            );
+        }
+        let title = scores_by_id(&format!("{full} title ==> 'quiet'"));
+        let body = scores_by_id(&format!("{full} body ==> 'ruby'"));
+        for quals in [
+            "title ==> 'quiet' AND body ==> 'ruby'",
+            "body ==> 'ruby' AND title ==> 'quiet'",
+        ] {
+            assert_eq!(
+                scores_by_id(&format!("{full} {quals}")),
+                [title[0] + body[0]],
+                "{quals}"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn scores_across_indexed_columns_sum_per_column_scores() {
+        Spi::run(
+            "CREATE TABLE lite_field_sums (id int, title text, body text);
+             INSERT INTO lite_field_sums VALUES
+               (1, 'alpha title', 'beta body only'),
+               (2, 'beta title', 'alpha body only'),
+               (3, 'alpha beta', 'alpha beta both'),
+               (4, 'gamma', 'delta');
+             CREATE INDEX ON lite_field_sums USING tin (title);
+             CREATE INDEX ON lite_field_sums USING tin (body);",
+        )
+        .unwrap();
+        let scores = |quals: &str| {
+            scores_by_id(&format!(
+                "SELECT array_agg(tin.full_score(ctid) ORDER BY id)
+                   || array_agg(tin.max_score(ctid) ORDER BY id)
+                 FROM lite_field_sums WHERE {quals}"
+            ))
+        };
+        let title = scores("title ==> 'alpha'");
+        let body = scores("body ==> 'alpha'");
+        // tin's multi-index scan returns these scores and this maximum.
+        let (title_only, body_only, both) = (0.654_875_3, 0.640_724_24, 1.295_599_5);
+        assert_eq!(
+            [title_only, body_only, both],
+            [title[0], body[0], title[1] + body[1]]
+        );
+        assert_eq!(
+            scores("title ==> 'alpha' OR body ==> 'alpha'"),
+            [title_only, body_only, both, both, both, both]
+        );
+        assert_eq!(
+            scores("body ==> 'alpha' AND title ==> 'alpha'"),
+            [both, both]
+        );
+    }
+
+    #[pg_test]
+    fn max_score_across_indexed_columns_counts_rows_the_quals_admit() {
+        Spi::run(
+            "CREATE TABLE lite_field_max (id int, title text, body text);
+             INSERT INTO lite_field_max VALUES
+               (1, 'ruby ruby ruby', 'nothing here'),
+               (2, 'ruby and many other title words', 'ruby with plenty of other body words'),
+               (3, 'gems', 'gems'), (4, NULL, 'ruby gems'), (5, 'rails', NULL);
+             CREATE INDEX ON lite_field_max USING tin (title);
+             CREATE INDEX ON lite_field_max USING tin (body);",
+        )
+        .unwrap();
+        let scores = |quals: &str| {
+            scores_by_id(&format!(
+                "SELECT array_agg(tin.full_score(ctid) ORDER BY id) || max(tin.max_score(ctid))
+                 FROM lite_field_max WHERE {quals}"
+            ))
+        };
+        // The single-column match in row 1 outscores row 2, which alone
+        // matches both columns when the quals require both.
+        assert_eq!(
+            scores("title ==> 'ruby' OR body ==> 'ruby'"),
+            [1.068_417_9, 0.915_753_84, 0.802_591_5, 1.068_417_9]
+        );
+        for quals in [
+            "body ==> 'ruby' AND title ==> 'ruby'",
+            "title ==> 'ruby' AND (body ==> 'ruby' OR body ==> 'gems')",
+        ] {
+            assert_eq!(scores(quals), [0.915_753_84, 0.915_753_84], "{quals}");
+        }
+        // NULL columns score nothing.
+        assert_eq!(
+            scores("title ==> 'ruby OR rails' OR body ==> 'gems'"),
+            [
+                1.068_417_9,
+                0.467_246_86,
+                0.953_077_44,
+                0.802_591_5,
+                1.627_717_5,
+                1.627_717_5
+            ]
+        );
+    }
+
+    #[pg_test]
+    fn scoring_skips_columns_whose_partial_index_the_quals_do_not_imply() {
+        Spi::run(
+            "CREATE TABLE lite_field_partial (id int, title text, body text, active boolean);
+             INSERT INTO lite_field_partial VALUES
+               (1, 'ruby', 'ruby', true), (2, 'ruby', 'quiet', false),
+               (3, 'quiet', 'ruby ruby', true), (4, 'other', 'words', true);
+             CREATE INDEX ON lite_field_partial USING tin (title) WHERE active;
+             CREATE INDEX ON lite_field_partial USING tin (body);",
+        )
+        .unwrap();
+        let full =
+            "SELECT array_agg(tin.full_score(ctid) ORDER BY id) FROM lite_field_partial WHERE";
+        let body = scores_by_id(&format!("{full} body ==> 'ruby'"));
+        assert_eq!(body, [0.754_912_8, 0.815_467_3]);
+        // Without `active`, only the body search can score and the title
+        // search filters, as in tin.
+        assert_eq!(
+            scores_by_id(&format!("{full} title ==> 'ruby' AND body ==> 'ruby'")),
+            body[..1]
+        );
+        assert_eq!(
+            scores_by_id(&format!(
+                "{full} active AND (title ==> 'ruby' OR body ==> 'ruby')"
+            )),
+            [1.735_742, 0.815_467_3]
+        );
+    }
+
+    #[pg_test(error = "cannot compute scores for this query")]
+    fn scoring_refuses_an_unindexed_alternative_to_an_indexed_search() {
+        Spi::run(
+            "CREATE TABLE lite_field_unscannable (id int, title text, body text, active boolean);
+             INSERT INTO lite_field_unscannable VALUES (1, 'ruby', 'ruby', true);
+             CREATE INDEX ON lite_field_unscannable USING tin (title) WHERE active;
+             CREATE INDEX ON lite_field_unscannable USING tin (body);",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT tin.full_score(ctid) FROM lite_field_unscannable
+             WHERE title ==> 'ruby' OR body ==> 'ruby'",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
     fn highlighting_supports_explicit_and_implicit_queries() {
         assert_eq!(
             Spi::get_one::<String>(
