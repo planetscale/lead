@@ -20,22 +20,23 @@ use crate::bm25::{
 };
 use pgrx::iter::TableIterator;
 use pgrx::{
-    Internal, IntoDatum, PgBox, PgList, PgRelation, Spi, default, name, pg_extern, pg_guard, pg_sys,
+    FromDatum, Internal, IntoDatum, PgBox, PgList, PgMemoryContexts, PgRelation, Spi, default,
+    name, pg_extern, pg_guard, pg_sys,
 };
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::{Query, SpanTermSlot, evaluate, parse_tinql_to_query, tokenize_doc};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CacheKey {
-    transaction: u32,
-    command: u32,
+/// Identifies one search that a `score_bound` call site scores rows against.
+/// The search text can vary per row, as in `t.body ==> q.text` driven by a
+/// join, so a call site may hold several of these.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CorpusKey {
     heap_oid: u32,
     index_oid: u32,
     query: String,
-    full: bool,
+    mode: i32,
     dense: u32,
     k1: Option<u32>,
     b: Option<u32>,
@@ -43,15 +44,22 @@ struct CacheKey {
     replace: Option<Vec<String>>,
 }
 
+/// Corpus-wide statistics for one search: the retained terms with N, avgdl,
+/// and df baked into their scorers, and the best score among matching
+/// documents for the `max_score` modes.
 struct ScoreCorpus {
-    key: CacheKey,
-    by_document: FxHashMap<String, f32>,
+    tokenizer: CompiledTokenizerPipeline,
+    scorers: Vec<(String, TermScorer)>,
     max: f32,
 }
 
-thread_local! {
-    static SCORE_CACHE: RefCell<Option<ScoreCorpus>> = const { RefCell::new(None) };
+impl ScoreCorpus {
+    fn score(&self, document: &str) -> f32 {
+        score_tokens(&self.scorers, &tokenize(&self.tokenizer, document))
+    }
 }
+
+type CorpusMemo = FxHashMap<CorpusKey, ScoreCorpus>;
 
 fn score_context_error(function: &str) -> ! {
     pgrx::error!("{function} requires a tin index scan and cannot be used in this query context")
@@ -112,6 +120,7 @@ fn score_bound(
     b: Option<f32>,
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
+    fcinfo: pg_sys::FunctionCallInfo,
 ) -> f32 {
     let mut parts = Vec::with_capacity(query.len());
     for part in query {
@@ -119,40 +128,52 @@ fn score_bound(
         let Some(part) = part else { return 0.0 };
         parts.push(format!("({part})"));
     }
-    let query = parts.join(" OR ");
-    let key = CacheKey {
-        transaction: unsafe { pg_sys::GetTopTransactionIdIfAny().into_inner() },
-        command: unsafe { pg_sys::GetCurrentCommandId(false) },
+    let key = CorpusKey {
         heap_oid: heap_oid as u32,
         index_oid: index_oid as u32,
-        query,
-        full: mode == 1 || mode == 3,
+        query: parts.join(" OR "),
+        mode,
         dense: dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits(),
         k1: bits(k1),
         b: bits(b),
         add: term_add.clone(),
         replace: term_replace.clone(),
     };
-    SCORE_CACHE.with_borrow_mut(|slot| {
-        if slot.as_ref().is_none_or(|corpus| corpus.key != key) {
-            *slot = Some(build_corpus(key.clone(), k1, b, term_add, term_replace));
+    let memo = unsafe { corpus_memo(fcinfo) };
+    let corpus = memo
+        .entry(key)
+        .or_insert_with_key(|key| build_corpus(key, k1, b, term_add, term_replace));
+    if mode == 2 || mode == 3 {
+        corpus.max
+    } else {
+        corpus.score(document)
+    }
+}
+
+/// Returns the corpora memoized on this call site's `FmgrInfo`. The executor
+/// builds that `FmgrInfo`, and the `fn_mcxt` it lives in, for one execution
+/// of the statement, so a corpus never outlives the snapshot it was read
+/// under.
+unsafe fn corpus_memo<'a>(fcinfo: pg_sys::FunctionCallInfo) -> &'a mut CorpusMemo {
+    unsafe {
+        let flinfo = (*fcinfo).flinfo;
+        if (*flinfo).fn_extra.is_null() {
+            (*flinfo).fn_extra = PgMemoryContexts::For((*flinfo).fn_mcxt)
+                .leak_and_drop_on_delete(CorpusMemo::default())
+                .cast();
         }
-        let corpus = slot.as_ref().expect("score corpus was just populated");
-        if mode == 2 || mode == 3 {
-            corpus.max
-        } else {
-            corpus.by_document.get(document).copied().unwrap_or(0.0)
-        }
-    })
+        &mut *(*flinfo).fn_extra.cast::<CorpusMemo>()
+    }
 }
 
 fn build_corpus(
-    key: CacheKey,
+    key: &CorpusKey,
     k1: Option<f32>,
     b: Option<f32>,
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
 ) -> ScoreCorpus {
+    let full = key.mode == 1 || key.mode == 3;
     let heap_oid = pg_sys::Oid::from(key.heap_oid);
     let index = unsafe {
         PgRelation::with_lock(
@@ -171,7 +192,7 @@ fn build_corpus(
         .checked()
         .unwrap_or_else(|error| pgrx::error!("tin score parameters: {error}"));
     let dense = DenseRatio::new(Some(f32::from_bits(key.dense)));
-    if !key.full && !dense.is_valid() {
+    if !full && !dense.is_valid() {
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
     let query = parse_tinql_to_query(&key.query, &tokenizer)
@@ -186,7 +207,7 @@ fn build_corpus(
                 .map(|token| token.text.into_owned())
                 .collect::<Vec<_>>()
         });
-    let stop = if key.full {
+    let stop = if full {
         None
     } else {
         stop_csv.as_deref().and_then(ScoreStopWords::from_csv)
@@ -206,7 +227,7 @@ fn build_corpus(
             .iter()
             .filter(|tokens| tokens.iter().any(|token| token == term.text()))
             .count() as u64;
-        let ratio = (!key.full).then_some(dense);
+        let ratio = (!full).then_some(dense);
         if !term.is_retained(df, df, total_docs, ratio) {
             continue;
         }
@@ -215,30 +236,33 @@ fn build_corpus(
                 .unwrap_or_else(|error| pgrx::error!("tin score parameters: {error}"));
         scorers.push((term.text().to_owned(), scorer));
     }
-    let mut by_document = FxHashMap::default();
     let mut max = 0.0_f32;
-    for (document, tokens) in documents.into_iter().zip(tokenized) {
-        let score = sum_scores_in_order(scorers.iter().map(|(term, scorer)| {
-            let tf = tokens.iter().filter(|token| *token == term).count() as u32;
-            if tf == 0 {
-                0.0
-            } else {
-                scorer.score_count(tf, tokens.len() as u32)
+    if key.mode == 2 || key.mode == 3 {
+        for (document, tokens) in documents.iter().zip(&tokenized) {
+            let matched = evaluate(&query, &tokenize_doc(document, &tokenizer))
+                .unwrap_or_else(|error| pgrx::error!("tin score query evaluation failed: {error}"))
+                .matched;
+            if matched {
+                max = max.max(score_tokens(&scorers, tokens));
             }
-        }));
-        let matched = evaluate(&query, &tokenize_doc(&document, &tokenizer))
-            .unwrap_or_else(|error| pgrx::error!("tin score query evaluation failed: {error}"))
-            .matched;
-        if matched {
-            max = max.max(score);
         }
-        by_document.insert(document, score);
     }
     ScoreCorpus {
-        key,
-        by_document,
+        tokenizer,
+        scorers,
         max,
     }
+}
+
+fn score_tokens(scorers: &[(String, TermScorer)], tokens: &[String]) -> f32 {
+    sum_scores_in_order(scorers.iter().map(|(term, scorer)| {
+        let tf = tokens.iter().filter(|token| *token == term).count() as u32;
+        if tf == 0 {
+            0.0
+        } else {
+            scorer.score_count(tf, tokens.len() as u32)
+        }
+    }))
 }
 
 fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> {
@@ -261,31 +285,62 @@ fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> 
             index_oid.to_u32(),
             heap_oid.to_u32(),
         );
-        let (expression, predicate) = Spi::get_two::<String, String>(&index_sql)
-            .unwrap_or_else(|error| pgrx::error!("tin score index lookup failed: {error}"));
-        let expression = expression
+        let mut columns = select_read_only(&index_sql, "tin score index lookup failed")
+            .pop()
+            .unwrap_or_else(|| pgrx::error!("tin score index lookup failed: index not found"))
+            .into_iter();
+        let expression = columns
+            .next()
+            .flatten()
             .unwrap_or_else(|| pgrx::error!("tin score index expression no longer exists"));
-        let predicate = predicate
+        let predicate = columns
+            .next()
+            .flatten()
             .map(|predicate| format!(" AND ({predicate})"))
             .unwrap_or_default();
         let sql = format!(
             "SELECT ({expression})::text FROM {} WHERE ({expression}) IS NOT NULL{predicate}",
             CStr::from_ptr(qualified).to_string_lossy(),
         );
-        Spi::connect(|client| {
-            client
-                .select(&sql, None, &[])
-                .unwrap_or_else(|error| pgrx::error!("tin score corpus scan failed: {error}"))
-                .map(|row| {
-                    row.get::<String>(1)
-                        .unwrap_or_else(|error| {
-                            pgrx::error!("tin score corpus row failed: {error}")
-                        })
-                        .expect("corpus query excludes null documents")
-                })
-                .collect()
-        })
+        select_read_only(&sql, "tin score corpus scan failed")
+            .into_iter()
+            .map(|mut row| {
+                row.pop()
+                    .flatten()
+                    .expect("corpus query excludes null documents")
+            })
+            .collect()
     }
+}
+
+/// Runs a query through SPI in read-only mode and returns its rows as text.
+/// Read-only execution keeps the calling statement's snapshot, so the corpus
+/// matches the rows that statement sees. Writable execution would take a new
+/// snapshot for each query under READ COMMITTED, and pgrx picks writable
+/// execution once the transaction has an XID.
+fn select_read_only(sql: &str, failure: &str) -> Vec<Vec<Option<String>>> {
+    let sql = CString::new(sql).unwrap_or_else(|_| pgrx::error!("{failure}: query contains NUL"));
+    Spi::connect(|_| unsafe {
+        let status = pg_sys::SPI_execute(sql.as_ptr(), true, 0);
+        if status != pg_sys::SPI_OK_SELECT as i32 {
+            pgrx::error!("{failure}: SPI_execute returned {status}");
+        }
+        let table = &*pg_sys::SPI_tuptable;
+        let columns = (*table.tupdesc).natts;
+        (0..pg_sys::SPI_processed as usize)
+            .map(|row| {
+                let tuple = *table.vals.add(row);
+                (1..=columns)
+                    .map(|column| {
+                        let mut is_null = false;
+                        let datum =
+                            pg_sys::SPI_getbinval(tuple, table.tupdesc, column, &mut is_null);
+                        String::from_datum(datum, is_null)
+                    })
+                    .collect()
+            })
+            .collect()
+    })
 }
 
 fn tokenize_documents(
@@ -299,11 +354,15 @@ fn tokenize_documents(
             if row.is_multiple_of(10) {
                 pgrx::check_for_interrupts!();
             }
-            tokenizer
-                .tokenize(document)
-                .map(|token| token.text.into_owned())
-                .collect()
+            tokenize(tokenizer, document)
         })
+        .collect()
+}
+
+fn tokenize(tokenizer: &CompiledTokenizerPipeline, document: &str) -> Vec<String> {
+    tokenizer
+        .tokenize(document)
+        .map(|token| token.text.into_owned())
         .collect()
 }
 
