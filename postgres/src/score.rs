@@ -135,7 +135,9 @@ impl ScoreCorpus {
 /// Sums per-index scores the way tin does: exactly, rounding once to `f32`,
 /// so the total does not depend on the order of the indexes.
 fn sum_group_scores(scores: impl IntoIterator<Item = f32>) -> f32 {
-    scores.into_iter().map(f64::from).sum::<f64>() as f32
+    scores
+        .into_iter()
+        .fold(0.0_f64, |total, score| total + f64::from(score)) as f32
 }
 
 type CorpusMemo = FxHashMap<CorpusKey, ScoreCorpus>;
@@ -972,35 +974,135 @@ unsafe fn bind_search_groups(
             }),
         }
     }
-    if groups.is_empty() {
+    if groups.is_empty()
+        || (!unindexed.is_empty() && unsafe { has_unscannable_search(parse, rte, varno) })
+    {
         unsafe { refuse_unindexed_scoring(rte, varno, &unindexed) };
     }
     groups.sort_by_key(|group| group.index_oid.to_u32());
     groups
 }
 
-/// Marks the groups with a search among the quals that restrict every output
-/// row. `max_score` considers only documents that match every such group.
+/// Reports whether a search without a tin index is an alternative to one
+/// with a tin index, as in `title ==> 'a' OR body ==> 'b'` with only `body`
+/// indexed. tin cannot scan such a disjunction, so it cannot score the rows
+/// either alternative admits. A search without an index elsewhere only
+/// filters the rows that the indexed searches find.
+unsafe fn has_unscannable_search(
+    parse: *mut pg_sys::Query,
+    rte: *mut pg_sys::RangeTblEntry,
+    varno: i32,
+) -> bool {
+    let indexed =
+        |node| unsafe { search_index(parse, rte, varno, node).map(|index| index.is_some()) };
+    let searches_index = |node: *mut pg_sys::Node| {
+        let mut found = false;
+        visit_searches(node, &mut |search| found |= indexed(search) == Some(true));
+        found
+    };
+    let mut unscannable = false;
+    let clauses = unsafe { restriction_clauses(parse, varno) };
+    for clause in unsafe { PgList::<pg_sys::Node>::from_pg(clauses) }.iter_ptr() {
+        visit_disjunctions(clause, &mut |arms| {
+            unscannable |= arms.iter().enumerate().any(|(position, &arm)| {
+                indexed(arm) == Some(false)
+                    && arms.iter().enumerate().any(|(other, &alternative)| {
+                        other != position && searches_index(alternative)
+                    })
+            });
+        });
+    }
+    unscannable
+}
+
+/// Calls `visit` with the arms of every `OR` in `node` outside a `NOT`.
+fn visit_disjunctions(node: *mut pg_sys::Node, visit: &mut impl FnMut(&[*mut pg_sys::Node])) {
+    if node.is_null()
+        || is_negation(node)
+        || unsafe { (*node).type_ } != pg_sys::NodeTag::T_BoolExpr
+    {
+        return;
+    }
+    let expression = unsafe { &*node.cast::<pg_sys::BoolExpr>() };
+    let arms = unsafe { PgList::<pg_sys::Node>::from_pg(expression.args) }
+        .iter_ptr()
+        .collect::<Vec<_>>();
+    if expression.boolop == pg_sys::BoolExprType::OR_EXPR {
+        visit(&arms);
+    }
+    for arm in arms {
+        visit_disjunctions(arm, visit);
+    }
+}
+
+/// Calls `visit` with every node in `node` outside a `NOT`.
+fn visit_searches(node: *mut pg_sys::Node, visit: &mut impl FnMut(*mut pg_sys::Node)) {
+    if node.is_null() || is_negation(node) {
+        return;
+    }
+    visit(node);
+    if unsafe { (*node).type_ } == pg_sys::NodeTag::T_BoolExpr {
+        let expression = unsafe { &*node.cast::<pg_sys::BoolExpr>() };
+        for arm in unsafe { PgList::<pg_sys::Node>::from_pg(expression.args) }.iter_ptr() {
+            visit_searches(arm, visit);
+        }
+    }
+}
+
+/// Marks the groups that the quals restricting every output row require a
+/// match of. `max_score` considers only documents that match every such
+/// group.
 unsafe fn mark_required_groups(
     parse: *mut pg_sys::Query,
     rte: *mut pg_sys::RangeTblEntry,
     varno: i32,
     groups: &mut [SearchGroup],
 ) {
-    unsafe {
-        let clauses = restriction_clauses(parse, varno);
-        for clause in PgList::<pg_sys::Node>::from_pg(clauses).iter_ptr() {
-            let Some((document, _)) = search_operands(clause) else {
-                continue;
-            };
-            let Some(index_oid) = find_matching_tin_index(parse, (*rte).relid, varno, document)
-            else {
-                continue;
-            };
-            for group in groups.iter_mut() {
-                group.required |= group.index_oid == index_oid;
-            }
+    let bound = |node| unsafe { search_index(parse, rte, varno, node) };
+    let clauses = unsafe { restriction_clauses(parse, varno) };
+    for clause in unsafe { PgList::<pg_sys::Node>::from_pg(clauses) }.iter_ptr() {
+        for group in groups.iter_mut() {
+            group.required |= requires_index(clause, group.index_oid, &bound);
         }
+    }
+}
+
+/// Returns the tin index that a search on relation `varno` binds to, with
+/// `Some(None)` for a search without one, or `None` when `node` is not a
+/// search on the relation.
+unsafe fn search_index(
+    parse: *mut pg_sys::Query,
+    rte: *mut pg_sys::RangeTblEntry,
+    varno: i32,
+    node: *mut pg_sys::Node,
+) -> Option<Option<pg_sys::Oid>> {
+    unsafe {
+        let (document, _) = search_operands(node)?;
+        (single_varno(document) == Some(varno))
+            .then(|| find_matching_tin_index(parse, (*rte).relid, varno, document))
+    }
+}
+
+/// Reports whether every row that satisfies `node` matches a search bound to
+/// `index_oid`.
+fn requires_index(
+    node: *mut pg_sys::Node,
+    index_oid: pg_sys::Oid,
+    bound: &impl Fn(*mut pg_sys::Node) -> Option<Option<pg_sys::Oid>>,
+) -> bool {
+    if node.is_null() || is_negation(node) {
+        return false;
+    }
+    if unsafe { (*node).type_ } != pg_sys::NodeTag::T_BoolExpr {
+        return bound(node) == Some(Some(index_oid));
+    }
+    let expression = unsafe { &*node.cast::<pg_sys::BoolExpr>() };
+    let arms = unsafe { PgList::<pg_sys::Node>::from_pg(expression.args) };
+    let mut arms = arms.iter_ptr();
+    if expression.boolop == pg_sys::BoolExprType::OR_EXPR {
+        arms.all(|arm| requires_index(arm, index_oid, bound))
+    } else {
+        arms.any(|arm| requires_index(arm, index_oid, bound))
     }
 }
 
