@@ -949,6 +949,78 @@ mod tests {
     }
 
     #[pg_test]
+    fn max_score_adapts_to_the_relations_score_calls() {
+        Spi::run(
+            "CREATE TABLE lite_max_policy (id int, title text, body text);
+             INSERT INTO lite_max_policy SELECT g, 'filler ' || g, 'padding ' || g
+               FROM generate_series(1, 40) AS g;
+             UPDATE lite_max_policy SET body = 'ruby ruby ruby' WHERE id = 1;
+             UPDATE lite_max_policy SET body = 'ruby and other body words' WHERE id = 2;
+             UPDATE lite_max_policy SET body = 'ruby gems', title = 'gems' WHERE id = 3;
+             UPDATE lite_max_policy SET body = 'gems' WHERE id = 4;
+             CREATE INDEX ON lite_max_policy USING tin (title);
+             CREATE INDEX ON lite_max_policy USING tin (body);",
+        )
+        .unwrap();
+        let max = |select: &str, quals: &str| {
+            Spi::get_one::<f32>(&format!(
+                "SELECT max(tin.max_score(ctid)){select} FROM lite_max_policy WHERE {quals}"
+            ))
+            .unwrap()
+        };
+        let full = max(", max(tin.full_score(ctid))", "body ==> 'ruby'");
+        assert!(full.is_some_and(|full| full > 0.0));
+        // Alone, max_score reports the full_score maximum, as tin does.
+        assert_eq!(max("", "body ==> 'ruby'"), full);
+        // Beside tin.score it takes that call's policy, which elides ruby,
+        // in 3 of 40 documents, at a dense_ratio of 0.05.
+        assert_eq!(max(", max(tin.score(ctid))", "body ==> 'ruby'"), full);
+        assert_eq!(
+            max(", max(tin.score(ctid, 0.05))", "body ==> 'ruby'"),
+            Some(0.0)
+        );
+        // tin computes no maximum under the score policy for several scans.
+        for quals in [
+            "title ==> 'gems' OR body ==> 'ruby'",
+            "body ==> 'ruby' OR id = 5",
+        ] {
+            assert_eq!(max(", max(tin.score(ctid))", quals), None, "{quals}");
+            assert!(max("", quals).is_some_and(|max| max > 0.0), "{quals}");
+        }
+        assert!(
+            max(
+                ", max(tin.score(ctid))",
+                "body ==> 'ruby' OR body ==> 'gems'"
+            )
+            .is_some_and(|max| max > 0.0)
+        );
+    }
+
+    #[pg_test(
+        error = "tin.score() and tin.full_score() cannot be combined on one scanned relation; use one scoring function per relation (tin.max_score() adapts to either)"
+    )]
+    fn score_and_full_score_cannot_score_one_relation() {
+        Spi::run(
+            "CREATE TABLE lite_mixed_family (body text);
+             CREATE INDEX ON lite_mixed_family USING tin (body);
+             SELECT tin.score(ctid), tin.full_score(ctid) FROM lite_mixed_family
+             WHERE body ==> 'ruby';",
+        )
+        .unwrap();
+    }
+
+    #[pg_test(error = "tin.score() calls on one relation must use identical dense_ratio arguments")]
+    fn score_calls_on_one_relation_share_their_scan_arguments() {
+        Spi::run(
+            "CREATE TABLE lite_mixed_ratio (body text);
+             CREATE INDEX ON lite_mixed_ratio USING tin (body);
+             SELECT tin.score(ctid), tin.score(ctid, 0.5) FROM lite_mixed_ratio
+             WHERE body ==> 'ruby';",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
     fn other_search_operators_do_not_bind_scoring_or_highlighting() {
         Spi::run(
             "CREATE TABLE lite_other_operator (id int, body text);

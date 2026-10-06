@@ -37,9 +37,11 @@ enum ScoreMode {
     Score = 0,
     /// `tin.full_score`: every query term scores.
     FullScore = 1,
-    /// `tin.max_score` under the `tin.score` policy.
+    /// `tin.max_score` on a relation that `tin.score` also scores, under that
+    /// call's policy.
     MaxScore = 2,
-    /// `tin.max_score` in a query that also calls `tin.full_score`.
+    /// `tin.max_score` on any other relation, under the `tin.full_score`
+    /// policy.
     MaxFullScore = 3,
 }
 
@@ -1128,55 +1130,134 @@ unsafe fn deparse_search_expression(
     }
 }
 
-struct FullScoreBinding {
+/// The `dense_ratio`, `term_add`, and `term_replace` arguments of a
+/// `tin.score` call, which a scan shares between its `tin.score` calls and
+/// the `tin.max_score` that adapts to them.
+const SCAN_ARGUMENTS: [(i32, &str); 3] = [(1, "dense_ratio"), (4, "term_add"), (5, "term_replace")];
+
+/// The scoring calls on one relation, found in the query either as written
+/// or already rewritten into `score_bound` by earlier clauses.
+struct ScoringCalls {
     ctid: *const pg_sys::Var,
     documents: *mut pg_sys::Node,
     support: pg_sys::Oid,
     bound: pg_sys::Oid,
+    full: bool,
+    /// The scan arguments of each `tin.score` call, simplified.
+    score: Vec<[*mut pg_sys::Node; 3]>,
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn has_full_score(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
+unsafe extern "C-unwind" fn collect_scoring_calls(
+    node: *mut pg_sys::Node,
+    context: *mut c_void,
+) -> bool {
     unsafe {
         if node.is_null() || (*node).type_ == pg_sys::NodeTag::T_Query {
             return false;
         }
-        let binding = &*context.cast::<FullScoreBinding>();
+        let calls = &mut *context.cast::<ScoringCalls>();
         if (*node).type_ == pg_sys::NodeTag::T_FuncExpr {
             let function = &*node.cast::<pg_sys::FuncExpr>();
-            // Earlier query clauses may already contain the rewritten scorer.
-            if function.funcid == binding.bound {
+            if function.funcid == calls.bound {
                 let mode = pg_sys::list_nth(function.args, 6).cast::<pg_sys::Const>();
                 if (*mode).xpr.type_ == pg_sys::NodeTag::T_Const
-                    && (*mode).constvalue.value() == ScoreMode::FullScore as usize
-                    && pg_sys::equal(pg_sys::list_nth(function.args, 0), binding.documents.cast())
+                    && pg_sys::equal(pg_sys::list_nth(function.args, 0), calls.documents.cast())
                 {
-                    return true;
-                }
-            } else if pg_sys::get_func_support(function.funcid) == binding.support
-                && CStr::from_ptr(pg_sys::get_func_name(function.funcid)).to_bytes()
-                    == b"full_score"
-            {
-                for position in 0..pg_sys::list_length(function.args) {
-                    let mut argument =
-                        pg_sys::list_nth(function.args, position).cast::<pg_sys::Node>();
-                    if (*argument).type_ == pg_sys::NodeTag::T_NamedArgExpr {
-                        let named = &*argument.cast::<pg_sys::NamedArgExpr>();
-                        if named.argnumber != 0 {
-                            continue;
+                    let argument = |position| pg_sys::list_nth(function.args, position).cast();
+                    match ScoreMode::try_from((*mode).constvalue.value() as i32) {
+                        Ok(ScoreMode::FullScore) => calls.full = true,
+                        Ok(ScoreMode::Score) => {
+                            calls.score.push([argument(7), argument(10), argument(11)])
                         }
-                        argument = named.arg.cast();
-                    } else if position != 0 {
-                        continue;
+                        _ => {}
                     }
-                    if pg_sys::equal(argument.cast(), binding.ctid.cast()) {
-                        return true;
+                }
+            } else if pg_sys::get_func_support(function.funcid) == calls.support {
+                let name = CStr::from_ptr(pg_sys::get_func_name(function.funcid)).to_bytes();
+                if name == b"score" || name == b"full_score" {
+                    let args = expanded_arguments(function);
+                    if pg_sys::equal(pg_sys::list_nth(args, 0), calls.ctid.cast()) {
+                        if name == b"full_score" {
+                            calls.full = true;
+                        } else {
+                            calls.score.push(SCAN_ARGUMENTS.map(|(position, _)| {
+                                pg_sys::eval_const_expressions(
+                                    std::ptr::null_mut(),
+                                    pg_sys::list_nth(args, position).cast(),
+                                )
+                            }));
+                        }
                     }
                 }
             }
         }
-        pg_sys::expression_tree_walker(node, Some(has_full_score), context)
+        pg_sys::expression_tree_walker(node, Some(collect_scoring_calls), context)
     }
+}
+
+/// Returns a call's arguments in positional order with defaults filled in,
+/// the form the planner gives the support function.
+unsafe fn expanded_arguments(function: &pg_sys::FuncExpr) -> *mut pg_sys::List {
+    unsafe {
+        let tuple = pg_sys::SearchSysCache1(
+            pg_sys::SysCacheIdentifier::PROCOID as i32,
+            pg_sys::Datum::from(function.funcid),
+        );
+        if tuple.is_null() {
+            pgrx::error!(
+                "cache lookup failed for function {}",
+                function.funcid.to_u32()
+            );
+        }
+        let args = pg_sys::expand_function_arguments(
+            pg_sys::copyObjectImpl(function.args.cast()).cast(),
+            false,
+            function.funcresulttype,
+            tuple,
+        );
+        pg_sys::ReleaseSysCache(tuple);
+        args
+    }
+}
+
+/// Reports whether a disjunction in the quals restricting relation `varno`
+/// combines one of its searches with a qual that is not purely searches, as
+/// in `body ==> 'a' OR id = 1`. tin scans such a disjunction with several
+/// scans, and computes no `max_score` for them under the `tin.score`
+/// policy.
+unsafe fn has_mixed_disjunction(parse: *mut pg_sys::Query, varno: i32) -> bool {
+    let is_search = |node| unsafe {
+        crate::operator::search_operands(node)
+            .is_some_and(|(document, _)| single_varno(document) == Some(varno))
+    };
+    let mut mixed = false;
+    let clauses = unsafe { restriction_clauses(parse, varno) };
+    for clause in unsafe { PgList::<pg_sys::Node>::from_pg(clauses) }.iter_ptr() {
+        visit_disjunctions(clause, &mut |arms| {
+            let searches = arms.iter().any(|&arm| {
+                let mut found = false;
+                visit_searches(arm, &mut |node| found |= is_search(node));
+                found
+            });
+            mixed |= searches && !arms.iter().all(|&arm| only_searches(arm, &is_search));
+        });
+    }
+    mixed
+}
+
+/// Reports whether `node` combines nothing but searches with `AND` and `OR`.
+fn only_searches(node: *mut pg_sys::Node, is_search: &impl Fn(*mut pg_sys::Node) -> bool) -> bool {
+    if node.is_null() || is_negation(node) {
+        return false;
+    }
+    if unsafe { (*node).type_ } != pg_sys::NodeTag::T_BoolExpr {
+        return is_search(node);
+    }
+    let expression = unsafe { &*node.cast::<pg_sys::BoolExpr>() };
+    unsafe { PgList::<pg_sys::Node>::from_pg(expression.args) }
+        .iter_ptr()
+        .all(|arm| only_searches(arm, is_search))
 }
 
 #[pg_extern(immutable, parallel_unsafe)]
@@ -1233,30 +1314,55 @@ fn score_support(request: Internal) -> Internal {
         let original_nargs = pg_sys::list_length((*request.fcall).args);
         let function_name = pg_sys::get_func_name((*request.fcall).funcid);
         let fname = CStr::from_ptr(function_name).to_string_lossy();
-        let mode = if fname.as_ref() == "full_score" {
-            ScoreMode::FullScore
-        } else if fname.as_ref() == "max_score" {
-            let mut binding = FullScoreBinding {
-                ctid,
-                documents,
-                support: pg_sys::get_func_support((*request.fcall).funcid),
-                bound: lookup_score_bound(),
-            };
-            let full = pg_sys::query_tree_walker(
-                parse,
-                Some(has_full_score),
-                (&mut binding as *mut FullScoreBinding).cast(),
-                pg_sys::QTW_IGNORE_RC_SUBQUERIES as i32,
-            );
-            mark_required_groups(parse, rte, ctid.varno, &mut groups);
-            if full {
-                ScoreMode::MaxFullScore
-            } else {
-                ScoreMode::MaxScore
-            }
-        } else {
-            ScoreMode::Score
+        let mut calls = ScoringCalls {
+            ctid,
+            documents,
+            support: pg_sys::get_func_support((*request.fcall).funcid),
+            bound: lookup_score_bound(),
+            full: false,
+            score: Vec::new(),
         };
+        pg_sys::query_tree_walker(
+            parse,
+            Some(collect_scoring_calls),
+            (&mut calls as *mut ScoringCalls).cast(),
+            pg_sys::QTW_IGNORE_RC_SUBQUERIES as i32,
+        );
+        if calls.full && !calls.score.is_empty() {
+            pgrx::error!(
+                "tin.score() and tin.full_score() cannot be combined on one scanned relation; \
+                 use one scoring function per relation (tin.max_score() adapts to either)"
+            );
+        }
+        for (index, (_, name)) in SCAN_ARGUMENTS.iter().enumerate() {
+            if calls
+                .score
+                .iter()
+                .any(|call| !pg_sys::equal(call[index].cast(), calls.score[0][index].cast()))
+            {
+                pgrx::error!(
+                    "tin.score() calls on one relation must use identical {name} arguments"
+                );
+            }
+        }
+        // tin.max_score adapts to the relation's tin.score calls, and
+        // otherwise reports the full_score maximum.
+        let mode = match fname.as_ref() {
+            "full_score" => ScoreMode::FullScore,
+            "max_score" if calls.score.is_empty() => ScoreMode::MaxFullScore,
+            "max_score" => ScoreMode::MaxScore,
+            _ => ScoreMode::Score,
+        };
+        if mode == ScoreMode::MaxScore
+            && (groups.len() > 1 || has_mixed_disjunction(parse, ctid.varno))
+        {
+            return Internal::from(Some(pg_sys::Datum::from(
+                make_null_const(pg_sys::FLOAT4OID) as usize,
+            )));
+        }
+        if mode.is_max() {
+            mark_required_groups(parse, rte, ctid.varno, &mut groups);
+        }
         let mut args = PgList::<pg_sys::Node>::new();
         args.push(documents);
         let mut queries = PgList::<pg_sys::Node>::new();
@@ -1293,6 +1399,13 @@ fn score_support(request: Internal) -> Internal {
                     .cast(),
                 );
             }
+        } else if mode == ScoreMode::MaxScore {
+            let [dense_ratio, term_add, term_replace] = calls.score[0];
+            args.push(pg_sys::copyObjectImpl(dense_ratio.cast()).cast());
+            args.push(null_float().cast());
+            args.push(null_float().cast());
+            args.push(pg_sys::copyObjectImpl(term_add.cast()).cast());
+            args.push(pg_sys::copyObjectImpl(term_replace.cast()).cast());
         } else {
             args.push(null_float().cast());
             if mode == ScoreMode::FullScore && original_nargs == 3 {
