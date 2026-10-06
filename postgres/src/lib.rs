@@ -691,6 +691,18 @@ mod session_tests {
 
     #[test]
     fn successive_autocommit_statements_score_their_own_snapshot() {
+        // Each statement makes exactly one scoring call, as in the plain psql
+        // session that first showed scores leaking across snapshots.
+        fn full_score(client: &mut postgres::Client) -> (String, f32) {
+            let row = client
+                .query_one(
+                    "SELECT body, tin.full_score(ctid) FROM lead_cache_probe
+                     WHERE body ==> 'sofa'",
+                    &[],
+                )
+                .unwrap();
+            (row.get(0), row.get(1))
+        }
         let mut client = session();
         client
             .batch_execute(
@@ -701,25 +713,25 @@ mod session_tests {
         client
             .execute("INSERT INTO lead_cache_probe VALUES (1, 'Blue sofa')", &[])
             .unwrap();
-        let blue = sofa(&mut client, "lead_cache_probe");
-        assert_eq!(blue.len(), 1);
-        assert!((blue[0].1 - 0.2876821).abs() < 0.000001, "{blue:?}");
-        assert_eq!(blue[0].2, blue[0].1);
+        let blue = full_score(&mut client);
+        assert!((blue.1 - 0.2876821).abs() < 0.000001, "{blue:?}");
 
         client
             .execute("UPDATE lead_cache_probe SET body = 'Red sofa'", &[])
             .unwrap();
-        assert_eq!(
-            sofa(&mut client, "lead_cache_probe"),
-            vec![("Red sofa".into(), blue[0].1, blue[0].1)]
-        );
+        assert_eq!(full_score(&mut client), ("Red sofa".into(), blue.1));
 
         client
             .execute("UPDATE lead_cache_probe SET body = 'sofa sofa sofa'", &[])
             .unwrap();
         let repeated = sofa(&mut client, "lead_cache_probe");
-        assert!(repeated[0].1 > blue[0].1, "{repeated:?}");
+        assert_eq!(repeated.len(), 1);
+        assert!(repeated[0].1 > blue.1, "{repeated:?}");
         assert_eq!(repeated[0].2, repeated[0].1);
+        assert_eq!(
+            full_score(&mut client),
+            ("sofa sofa sofa".into(), repeated[0].1)
+        );
     }
 
     #[test]
