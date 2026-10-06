@@ -312,6 +312,108 @@ mod tests {
         assert_eq!(nested, direct);
     }
 
+    #[pg_test]
+    fn several_searches_score_like_one_ored_search() {
+        Spi::run(
+            "CREATE TABLE lite_ored (id int, body text);
+             INSERT INTO lite_ored VALUES
+               (1, 'beer wine'), (2, 'beer beer ale'), (3, 'wine cellar'),
+               (4, 'craft beer bar'), (5, 'water');
+             CREATE INDEX ON lite_ored USING tin (body);",
+        )
+        .unwrap();
+        let scores = |function: &str, quals: &str| {
+            Spi::get_one::<Vec<f32>>(&format!(
+                "SELECT array_agg(tin.{function}(ctid) ORDER BY id) FROM lite_ored WHERE {quals}"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        for (separate, ored) in [
+            (
+                "body ==> 'beer' OR body ==> 'wine'",
+                "body ==> '(beer) OR (wine)'",
+            ),
+            (
+                "body ==> 'beer^2 OR ale' OR body ==> '\"craft beer\"'
+                   OR body ==> 'wine~1 cellar'",
+                "body ==> '(beer^2 OR ale) OR (\"craft beer\") OR (wine~1 cellar)'",
+            ),
+            // An empty search matches nothing and leaves the others to score.
+            ("body ==> 'beer' OR body ==> ''", "body ==> 'beer'"),
+        ] {
+            for function in ["score", "full_score", "max_score"] {
+                let (separate, ored) = (scores(function, separate), scores(function, ored));
+                if function == "full_score" {
+                    assert!(separate.iter().all(|score| *score > 0.0), "{separate:?}");
+                }
+                assert_eq!(
+                    separate
+                        .iter()
+                        .map(|score| score.to_bits())
+                        .collect::<Vec<_>>(),
+                    ored.iter().map(|score| score.to_bits()).collect::<Vec<_>>(),
+                    "{function}: {separate:?} / {ored:?}"
+                );
+            }
+        }
+    }
+
+    #[pg_test]
+    fn scoring_binds_search_text_from_another_relation_per_row() {
+        Spi::run(
+            "CREATE TABLE lite_join_docs (id int, body text);
+             INSERT INTO lite_join_docs VALUES
+               (1, 'red sofa'), (2, 'blue sofa sofa'), (3, 'oak table'),
+               (4, 'pine table'), (5, 'glass table'), (6, 'green chair');
+             CREATE INDEX ON lite_join_docs USING tin (body);
+             CREATE TABLE lite_join_queries (query text);
+             INSERT INTO lite_join_queries VALUES ('sofa'), ('red'), ('red OR table');",
+        )
+        .unwrap();
+        let joined = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT q.query, d.id, tin.full_score(d.ctid)
+                     FROM lite_join_queries q JOIN lite_join_docs d ON d.body ==> q.query
+                     ORDER BY 1, 2",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| {
+                    (
+                        row.get::<String>(1).unwrap().unwrap(),
+                        row.get::<i32>(2).unwrap().unwrap(),
+                        row.get::<f32>(3).unwrap().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(joined.len(), 7, "{joined:?}");
+        for (query, id, score) in &joined {
+            let literal = Spi::get_one::<f32>(&format!(
+                "SELECT tin.full_score(ctid) FROM lite_join_docs
+                 WHERE body ==> '{query}' AND id = {id}"
+            ))
+            .unwrap();
+            assert_eq!(literal, Some(*score), "{query} / {id}");
+        }
+        let score = |search: &str, id| {
+            joined
+                .iter()
+                .find(|(query, row, _)| query == search && *row == id)
+                .unwrap()
+                .2
+        };
+        assert!(score("red", 1) > 0.0);
+        assert_ne!(score("red", 1), score("sofa", 1));
+    }
+
+    /// Lets the session tests below start the shared test server.
+    #[pg_test]
+    fn test_server_is_ready() {}
+
     #[pg_test(error = "tin.score_bound() is missing: the installed tin SQL predates this build")]
     fn scoring_reports_an_outdated_installed_extension() {
         Spi::run(
@@ -566,6 +668,85 @@ mod tests {
         assert_eq!(partial, control);
     }
 
+    fn scores_by_id(sql: &str) -> Vec<f32> {
+        Spi::get_one::<Vec<f32>>(sql).unwrap().unwrap()
+    }
+
+    #[pg_test]
+    fn scoring_binds_partial_indexes_the_quals_imply() {
+        Spi::run(
+            "CREATE TABLE lite_implied (id int, body text, active boolean);
+             INSERT INTO lite_implied VALUES
+               (1, 'beer wine', true), (2, 'beer', true), (3, 'wine', true);
+             INSERT INTO lite_implied
+               SELECT n, 'beer', false FROM generate_series(4, 40) AS n;
+             CREATE INDEX lite_implied_idx ON lite_implied USING tin (body) WHERE active;
+             CREATE TABLE lite_implied_control AS
+               SELECT id, body FROM lite_implied WHERE active;
+             CREATE INDEX lite_implied_control_idx ON lite_implied_control
+               USING tin (body);",
+        )
+        .unwrap();
+        let control = scores_by_id(
+            "SELECT array_agg(tin.full_score(ctid) + tin.max_score(ctid) ORDER BY id)
+             FROM lite_implied_control WHERE body ==> 'beer'",
+        );
+        assert_eq!(control.len(), 2);
+        for sql in [
+            "SELECT array_agg(tin.full_score(ctid) + tin.max_score(ctid) ORDER BY id)
+             FROM lite_implied WHERE active = true AND body ==> 'beer'",
+            // An outer join's ON clause restricts its nullable side.
+            "SELECT array_agg(tin.full_score(t.ctid) + tin.max_score(t.ctid) ORDER BY t.id)
+             FROM generate_series(1, 3) AS g(id)
+             LEFT JOIN lite_implied t ON t.id = g.id AND t.active AND t.body ==> 'beer'
+             WHERE t.id IS NOT NULL",
+            "SELECT array_agg(tin.full_score(t.ctid) + tin.max_score(t.ctid) ORDER BY t.id)
+             FROM generate_series(1, 3) AS g(id)
+             LEFT JOIN lite_implied t ON t.id = g.id
+             WHERE t.active AND t.body ==> 'beer'",
+        ] {
+            assert_eq!(scores_by_id(sql), control, "{sql}");
+        }
+    }
+
+    #[pg_test]
+    fn scoring_skips_partial_indexes_the_quals_do_not_imply() {
+        Spi::run(
+            "CREATE TABLE lite_twin (id int, body text, active boolean);
+             INSERT INTO lite_twin VALUES
+               (1, 'beer wine', true), (2, 'beer', true), (3, 'wine', true);
+             INSERT INTO lite_twin
+               SELECT n, 'beer', false FROM generate_series(4, 40) AS n;
+             CREATE INDEX lite_twin_partial_idx ON lite_twin USING tin (body) WHERE active;
+             CREATE INDEX lite_twin_full_idx ON lite_twin USING tin (body);
+             CREATE TABLE lite_twin_all AS SELECT id, body FROM lite_twin;
+             CREATE INDEX lite_twin_all_idx ON lite_twin_all USING tin (body);
+             CREATE TABLE lite_twin_active AS SELECT id, body FROM lite_twin WHERE active;
+             CREATE INDEX lite_twin_active_idx ON lite_twin_active USING tin (body);",
+        )
+        .unwrap();
+        let full = "array_agg(tin.full_score(ctid) ORDER BY id)";
+        let all = scores_by_id(&format!(
+            "SELECT {full} FROM lite_twin_all WHERE body ==> 'beer'"
+        ));
+        let active = scores_by_id(&format!(
+            "SELECT {full} FROM lite_twin_active WHERE body ==> 'beer'"
+        ));
+        assert_ne!(all[..2], active[..]);
+        assert_eq!(
+            scores_by_id(&format!(
+                "SELECT {full} FROM lite_twin WHERE body ==> 'beer'"
+            )),
+            all
+        );
+        assert_eq!(
+            scores_by_id(&format!(
+                "SELECT {full} FROM lite_twin WHERE active AND body ==> 'beer'"
+            )),
+            active
+        );
+    }
+
     #[pg_test]
     fn highlighting_supports_explicit_and_implicit_queries() {
         assert_eq!(
@@ -601,5 +782,257 @@ mod tests {
         .unwrap();
         assert!(ansi.contains("\x1b["));
         assert!(ansi.contains("Beer"));
+    }
+}
+
+/// Scoring checks that span several transactions or sessions, which a
+/// `#[pg_test]` cannot express because it runs inside one transaction.
+#[cfg(all(test, feature = "pg_test"))]
+mod session_tests {
+    fn session() -> postgres::Client {
+        pgrx_tests::run_test(
+            "test_server_is_ready",
+            None,
+            crate::pg_test::postgresql_conf_options(),
+        )
+        .unwrap();
+        pgrx_tests::client().unwrap().0
+    }
+
+    fn scores(client: &mut postgres::Client, sql: &str) -> Vec<(String, f32, f32)> {
+        client
+            .query(sql, &[])
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect()
+    }
+
+    const SOFA: &str = "SELECT body, tin.full_score(ctid), tin.max_score(ctid)
+                        FROM {table} WHERE body ==> 'sofa' ORDER BY id";
+
+    fn sofa(client: &mut postgres::Client, table: &str) -> Vec<(String, f32, f32)> {
+        scores(client, &SOFA.replace("{table}", table))
+    }
+
+    #[test]
+    fn successive_autocommit_statements_score_their_own_snapshot() {
+        // Each statement makes exactly one scoring call, as in the plain psql
+        // session that first showed scores leaking across snapshots.
+        fn full_score(client: &mut postgres::Client) -> (String, f32) {
+            let row = client
+                .query_one(
+                    "SELECT body, tin.full_score(ctid) FROM lead_cache_probe
+                     WHERE body ==> 'sofa'",
+                    &[],
+                )
+                .unwrap();
+            (row.get(0), row.get(1))
+        }
+        let mut client = session();
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE lead_cache_probe (id integer PRIMARY KEY, body text);
+                 CREATE INDEX ON lead_cache_probe USING tin (body);",
+            )
+            .unwrap();
+        client
+            .execute("INSERT INTO lead_cache_probe VALUES (1, 'Blue sofa')", &[])
+            .unwrap();
+        let blue = full_score(&mut client);
+        assert!((blue.1 - 0.2876821).abs() < 0.000001, "{blue:?}");
+
+        client
+            .execute("UPDATE lead_cache_probe SET body = 'Red sofa'", &[])
+            .unwrap();
+        assert_eq!(full_score(&mut client), ("Red sofa".into(), blue.1));
+
+        client
+            .execute("UPDATE lead_cache_probe SET body = 'sofa sofa sofa'", &[])
+            .unwrap();
+        let repeated = sofa(&mut client, "lead_cache_probe");
+        assert_eq!(repeated.len(), 1);
+        assert!(repeated[0].1 > blue.1, "{repeated:?}");
+        assert_eq!(repeated[0].2, repeated[0].1);
+        assert_eq!(
+            full_score(&mut client),
+            ("sofa sofa sofa".into(), repeated[0].1)
+        );
+    }
+
+    #[test]
+    fn read_committed_statements_see_concurrent_commits_in_scores() {
+        let mut writer = session();
+        let mut reader = session();
+        writer
+            .batch_execute(
+                "DROP TABLE IF EXISTS lead_rc_probe;
+                 CREATE TABLE lead_rc_probe (id integer PRIMARY KEY, body text);
+                 CREATE INDEX ON lead_rc_probe USING tin (body);
+                 INSERT INTO lead_rc_probe VALUES (1, 'Blue sofa'), (2, 'green chair');",
+            )
+            .unwrap();
+        reader
+            .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SELECT pg_current_xact_id();")
+            .unwrap();
+        let blue = sofa(&mut reader, "lead_rc_probe");
+        assert_eq!(blue.len(), 1);
+        assert!(blue[0].1 > 0.0, "{blue:?}");
+
+        writer
+            .execute(
+                "UPDATE lead_rc_probe SET body = 'Red sofa' WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            sofa(&mut reader, "lead_rc_probe"),
+            vec![("Red sofa".into(), blue[0].1, blue[0].1)]
+        );
+        reader.batch_execute("COMMIT").unwrap();
+        writer.batch_execute("DROP TABLE lead_rc_probe").unwrap();
+    }
+
+    #[test]
+    fn corpus_statistics_use_the_statement_snapshot() {
+        let mut writer = session();
+        let mut reader = session();
+        writer
+            .batch_execute(
+                "DROP TABLE IF EXISTS lead_cursor_probe;
+                 CREATE TABLE lead_cursor_probe (id integer PRIMARY KEY, body text);
+                 CREATE INDEX ON lead_cursor_probe USING tin (body);
+                 INSERT INTO lead_cursor_probe VALUES (1, 'Blue sofa'), (2, 'green chair');",
+            )
+            .unwrap();
+        let before = sofa(&mut writer, "lead_cursor_probe");
+        assert_eq!(before.len(), 1);
+
+        // The cursor's snapshot predates the insert below, but the corpus is
+        // only read once the first row is fetched.
+        reader
+            .batch_execute(&format!(
+                "BEGIN ISOLATION LEVEL READ COMMITTED;
+                 DECLARE probe CURSOR FOR {};",
+                SOFA.replace("{table}", "lead_cursor_probe")
+            ))
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO lead_cursor_probe VALUES (3, 'sofa sofa'), (4, 'leather sofa')",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(scores(&mut reader, "FETCH ALL FROM probe"), before);
+        reader.batch_execute("COMMIT").unwrap();
+        assert_ne!(sofa(&mut writer, "lead_cursor_probe")[0], before[0]);
+        writer
+            .batch_execute("DROP TABLE lead_cursor_probe")
+            .unwrap();
+    }
+
+    #[test]
+    fn malformed_searches_fail_like_the_operator() {
+        let mut client = session();
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE lead_malformed (id integer, body text);
+                 INSERT INTO lead_malformed VALUES (1, 'beer a b'), (2, 'beer foo or bar');
+                 CREATE INDEX ON lead_malformed USING tin (body);",
+            )
+            .unwrap();
+        let mut message = |sql: &str| {
+            let error = client.query(sql, &[]).unwrap_err();
+            let error = error
+                .as_db_error()
+                .unwrap_or_else(|| panic!("{sql}: {error}"));
+            error.message().to_owned()
+        };
+        // Every row matches 'beer', so the malformed quals after it never run.
+        // Each text is invalid on its own but valid once wrapped in parentheses
+        // and joined with the others.
+        for searches in [
+            &["a) OR (b"][..],
+            &["\"foo\\", "bar\""],
+            &["beer AND (wine", "ale)"],
+            &["MATCHES fo(o", "bar)"],
+        ] {
+            let operator = message(&format!("SELECT 'beer' ==> '{}'", searches[0]));
+            assert!(operator.starts_with("invalid ==> query: "), "{operator}");
+            let quals = searches
+                .iter()
+                .map(|search| format!(" OR body ==> '{search}'"))
+                .collect::<String>();
+            for function in [
+                "tin.score(ctid)",
+                "tin.full_score(ctid)",
+                "tin.max_score(ctid)",
+                "tin.highlight(body)",
+                "tin.highlight_ansi(body)",
+            ] {
+                let sql =
+                    format!("SELECT {function} FROM lead_malformed WHERE body ==> 'beer'{quals}");
+                assert_eq!(message(&sql), operator, "{sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn unproved_partial_indexes_refuse_scoring_like_tin() {
+        let mut client = session();
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE lead_unproved (id integer, body text, active boolean);
+                 INSERT INTO lead_unproved VALUES (1, 'beer', true), (2, 'beer', false);
+                 CREATE INDEX ON lead_unproved USING tin (body) WHERE active;
+                 CREATE INDEX ON lead_unproved USING tin (lower(body)) WHERE active;",
+            )
+            .unwrap();
+        for (sql, expression) in [
+            (
+                "SELECT tin.score(ctid) FROM lead_unproved WHERE body ==> 'beer'",
+                "lead_unproved.body",
+            ),
+            (
+                "SELECT tin.full_score(t.ctid) FROM lead_unproved t
+                 WHERE lower(t.body) ==> 'beer' AND lower(t.body) ==> 'wine'",
+                "lower(lead_unproved.body)",
+            ),
+            (
+                "SELECT tin.max_score(ctid) FROM lead_unproved
+                 WHERE body ==> 'beer' AND active IS NOT NULL",
+                "lead_unproved.body",
+            ),
+            // An outer join's ON clause does not restrict its preserved side.
+            (
+                "SELECT tin.score(t.ctid) FROM lead_unproved t
+                 LEFT JOIN generate_series(1, 2) AS g(id) ON g.id = t.id AND t.active
+                 WHERE t.body ==> 'beer'",
+                "lead_unproved.body",
+            ),
+        ] {
+            let error = client.query(sql, &[]).unwrap_err();
+            let error = error
+                .as_db_error()
+                .unwrap_or_else(|| panic!("{sql}: {error}"));
+            assert_eq!(
+                (
+                    error.code().code(),
+                    error.message(),
+                    error.detail(),
+                    error.hint()
+                ),
+                (
+                    "0A000",
+                    "cannot compute scores for this query",
+                    Some(format!("No matching tin index for: {expression}.").as_str()),
+                    Some(
+                        "Add a matching USING tin index, or check the definition of an \
+                         existing index."
+                    ),
+                ),
+                "{sql}"
+            );
+        }
     }
 }

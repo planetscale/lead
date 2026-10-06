@@ -20,22 +20,62 @@ use crate::bm25::{
 };
 use pgrx::iter::TableIterator;
 use pgrx::{
-    Internal, IntoDatum, PgBox, PgList, PgRelation, Spi, default, name, pg_extern, pg_guard, pg_sys,
+    FromDatum, Internal, IntoDatum, PgBox, PgList, PgMemoryContexts, PgRelation, Spi, default,
+    name, pg_extern, pg_guard, pg_sys,
 };
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::{Query, SpanTermSlot, evaluate, parse_tinql_to_query, tokenize_doc};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CacheKey {
-    transaction: u32,
-    command: u32,
+/// Which scorer `score_support` rewrote into `score_bound`. It crosses the SQL
+/// boundary as the `int4` mode argument.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(i32)]
+enum ScoreMode {
+    /// `tin.score`: dense-ratio elision and score stop words apply.
+    Score = 0,
+    /// `tin.full_score`: every query term scores.
+    FullScore = 1,
+    /// `tin.max_score` under the `tin.score` policy.
+    MaxScore = 2,
+    /// `tin.max_score` in a query that also calls `tin.full_score`.
+    MaxFullScore = 3,
+}
+
+impl ScoreMode {
+    fn is_full(self) -> bool {
+        matches!(self, Self::FullScore | Self::MaxFullScore)
+    }
+
+    fn is_max(self) -> bool {
+        matches!(self, Self::MaxScore | Self::MaxFullScore)
+    }
+}
+
+impl TryFrom<i32> for ScoreMode {
+    type Error = i32;
+
+    fn try_from(mode: i32) -> Result<Self, i32> {
+        match mode {
+            0 => Ok(Self::Score),
+            1 => Ok(Self::FullScore),
+            2 => Ok(Self::MaxScore),
+            3 => Ok(Self::MaxFullScore),
+            _ => Err(mode),
+        }
+    }
+}
+
+/// Identifies one search that a `score_bound` call site scores rows against.
+/// The search texts can vary per row, as in `t.body ==> q.text` driven by a
+/// join, so a call site may hold several of these.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CorpusKey {
     heap_oid: u32,
     index_oid: u32,
-    query: String,
-    full: bool,
+    queries: Vec<String>,
+    mode: ScoreMode,
     dense: u32,
     k1: Option<u32>,
     b: Option<u32>,
@@ -43,15 +83,22 @@ struct CacheKey {
     replace: Option<Vec<String>>,
 }
 
+/// Corpus-wide statistics for one search: the retained terms with N, avgdl,
+/// and df baked into their scorers, and the best score among matching
+/// documents for the `max_score` modes.
 struct ScoreCorpus {
-    key: CacheKey,
-    by_document: FxHashMap<String, f32>,
+    tokenizer: CompiledTokenizerPipeline,
+    scorers: Vec<(String, TermScorer)>,
     max: f32,
 }
 
-thread_local! {
-    static SCORE_CACHE: RefCell<Option<ScoreCorpus>> = const { RefCell::new(None) };
+impl ScoreCorpus {
+    fn score(&self, document: &str) -> f32 {
+        score_tokens(&self.scorers, &tokenize(&self.tokenizer, document))
+    }
 }
+
+type CorpusMemo = FxHashMap<CorpusKey, ScoreCorpus>;
 
 fn score_context_error(function: &str) -> ! {
     pgrx::error!("{function} requires a tin index scan and cannot be used in this query context")
@@ -112,47 +159,60 @@ fn score_bound(
     b: Option<f32>,
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
+    fcinfo: pg_sys::FunctionCallInfo,
 ) -> f32 {
-    let mut parts = Vec::with_capacity(query.len());
-    for part in query {
-        // A NULL search expression matches no rows, so nothing needs a score.
-        let Some(part) = part else { return 0.0 };
-        parts.push(format!("({part})"));
-    }
-    let query = parts.join(" OR ");
-    let key = CacheKey {
-        transaction: unsafe { pg_sys::GetTopTransactionIdIfAny().into_inner() },
-        command: unsafe { pg_sys::GetCurrentCommandId(false) },
+    let mode = ScoreMode::try_from(mode)
+        .unwrap_or_else(|mode| pgrx::error!("tin.score_bound(): unknown score mode {mode}"));
+    // A NULL search expression matches no rows, so nothing needs a score.
+    let Some(queries) = query.into_iter().collect::<Option<Vec<_>>>() else {
+        return 0.0;
+    };
+    let key = CorpusKey {
         heap_oid: heap_oid as u32,
         index_oid: index_oid as u32,
-        query,
-        full: mode == 1 || mode == 3,
+        queries,
+        mode,
         dense: dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits(),
         k1: bits(k1),
         b: bits(b),
         add: term_add.clone(),
         replace: term_replace.clone(),
     };
-    SCORE_CACHE.with_borrow_mut(|slot| {
-        if slot.as_ref().is_none_or(|corpus| corpus.key != key) {
-            *slot = Some(build_corpus(key.clone(), k1, b, term_add, term_replace));
+    let memo = unsafe { corpus_memo(fcinfo) };
+    let corpus = memo
+        .entry(key)
+        .or_insert_with_key(|key| build_corpus(key, k1, b, term_add, term_replace));
+    if mode.is_max() {
+        corpus.max
+    } else {
+        corpus.score(document)
+    }
+}
+
+/// Returns the corpora memoized on this call site's `FmgrInfo`. The executor
+/// builds that `FmgrInfo`, and the `fn_mcxt` it lives in, for one execution
+/// of the statement, so a corpus never outlives the snapshot it was read
+/// under.
+unsafe fn corpus_memo<'a>(fcinfo: pg_sys::FunctionCallInfo) -> &'a mut CorpusMemo {
+    unsafe {
+        let flinfo = (*fcinfo).flinfo;
+        if (*flinfo).fn_extra.is_null() {
+            (*flinfo).fn_extra = PgMemoryContexts::For((*flinfo).fn_mcxt)
+                .leak_and_drop_on_delete(CorpusMemo::default())
+                .cast();
         }
-        let corpus = slot.as_ref().expect("score corpus was just populated");
-        if mode == 2 || mode == 3 {
-            corpus.max
-        } else {
-            corpus.by_document.get(document).copied().unwrap_or(0.0)
-        }
-    })
+        &mut *(*flinfo).fn_extra.cast::<CorpusMemo>()
+    }
 }
 
 fn build_corpus(
-    key: CacheKey,
+    key: &CorpusKey,
     k1: Option<f32>,
     b: Option<f32>,
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
 ) -> ScoreCorpus {
+    let full = key.mode.is_full();
     let heap_oid = pg_sys::Oid::from(key.heap_oid);
     let index = unsafe {
         PgRelation::with_lock(
@@ -171,11 +231,10 @@ fn build_corpus(
         .checked()
         .unwrap_or_else(|error| pgrx::error!("tin score parameters: {error}"));
     let dense = DenseRatio::new(Some(f32::from_bits(key.dense)));
-    if !key.full && !dense.is_valid() {
+    if !full && !dense.is_valid() {
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
-    let query = parse_tinql_to_query(&key.query, &tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("TIN score query error: {error}"));
+    let query = crate::operator::parse_searches(&key.queries, &tokenizer);
     let mut inputs = Vec::new();
     collect_score_terms(&query, 1.0, false, &mut inputs);
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
@@ -186,7 +245,7 @@ fn build_corpus(
                 .map(|token| token.text.into_owned())
                 .collect::<Vec<_>>()
         });
-    let stop = if key.full {
+    let stop = if full {
         None
     } else {
         stop_csv.as_deref().and_then(ScoreStopWords::from_csv)
@@ -206,7 +265,7 @@ fn build_corpus(
             .iter()
             .filter(|tokens| tokens.iter().any(|token| token == term.text()))
             .count() as u64;
-        let ratio = (!key.full).then_some(dense);
+        let ratio = (!full).then_some(dense);
         if !term.is_retained(df, df, total_docs, ratio) {
             continue;
         }
@@ -215,30 +274,33 @@ fn build_corpus(
                 .unwrap_or_else(|error| pgrx::error!("tin score parameters: {error}"));
         scorers.push((term.text().to_owned(), scorer));
     }
-    let mut by_document = FxHashMap::default();
     let mut max = 0.0_f32;
-    for (document, tokens) in documents.into_iter().zip(tokenized) {
-        let score = sum_scores_in_order(scorers.iter().map(|(term, scorer)| {
-            let tf = tokens.iter().filter(|token| *token == term).count() as u32;
-            if tf == 0 {
-                0.0
-            } else {
-                scorer.score_count(tf, tokens.len() as u32)
+    if key.mode.is_max() {
+        for (document, tokens) in documents.iter().zip(&tokenized) {
+            let matched = evaluate(&query, &tokenize_doc(document, &tokenizer))
+                .unwrap_or_else(|error| pgrx::error!("tin score query evaluation failed: {error}"))
+                .matched;
+            if matched {
+                max = max.max(score_tokens(&scorers, tokens));
             }
-        }));
-        let matched = evaluate(&query, &tokenize_doc(&document, &tokenizer))
-            .unwrap_or_else(|error| pgrx::error!("tin score query evaluation failed: {error}"))
-            .matched;
-        if matched {
-            max = max.max(score);
         }
-        by_document.insert(document, score);
     }
     ScoreCorpus {
-        key,
-        by_document,
+        tokenizer,
+        scorers,
         max,
     }
+}
+
+fn score_tokens(scorers: &[(String, TermScorer)], tokens: &[String]) -> f32 {
+    sum_scores_in_order(scorers.iter().map(|(term, scorer)| {
+        let tf = tokens.iter().filter(|token| *token == term).count() as u32;
+        if tf == 0 {
+            0.0
+        } else {
+            scorer.score_count(tf, tokens.len() as u32)
+        }
+    }))
 }
 
 fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> {
@@ -261,31 +323,62 @@ fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> 
             index_oid.to_u32(),
             heap_oid.to_u32(),
         );
-        let (expression, predicate) = Spi::get_two::<String, String>(&index_sql)
-            .unwrap_or_else(|error| pgrx::error!("tin score index lookup failed: {error}"));
-        let expression = expression
+        let mut columns = select_read_only(&index_sql, "tin score index lookup failed")
+            .pop()
+            .unwrap_or_else(|| pgrx::error!("tin score index lookup failed: index not found"))
+            .into_iter();
+        let expression = columns
+            .next()
+            .flatten()
             .unwrap_or_else(|| pgrx::error!("tin score index expression no longer exists"));
-        let predicate = predicate
+        let predicate = columns
+            .next()
+            .flatten()
             .map(|predicate| format!(" AND ({predicate})"))
             .unwrap_or_default();
         let sql = format!(
             "SELECT ({expression})::text FROM {} WHERE ({expression}) IS NOT NULL{predicate}",
             CStr::from_ptr(qualified).to_string_lossy(),
         );
-        Spi::connect(|client| {
-            client
-                .select(&sql, None, &[])
-                .unwrap_or_else(|error| pgrx::error!("tin score corpus scan failed: {error}"))
-                .map(|row| {
-                    row.get::<String>(1)
-                        .unwrap_or_else(|error| {
-                            pgrx::error!("tin score corpus row failed: {error}")
-                        })
-                        .expect("corpus query excludes null documents")
-                })
-                .collect()
-        })
+        select_read_only(&sql, "tin score corpus scan failed")
+            .into_iter()
+            .map(|mut row| {
+                row.pop()
+                    .flatten()
+                    .expect("corpus query excludes null documents")
+            })
+            .collect()
     }
+}
+
+/// Runs a query through SPI in read-only mode and returns its rows as text.
+/// Read-only execution keeps the calling statement's snapshot, so the corpus
+/// matches the rows that statement sees. Writable execution would take a new
+/// snapshot for each query under READ COMMITTED, and pgrx picks writable
+/// execution once the transaction has an XID.
+fn select_read_only(sql: &str, failure: &str) -> Vec<Vec<Option<String>>> {
+    let sql = CString::new(sql).unwrap_or_else(|_| pgrx::error!("{failure}: query contains NUL"));
+    Spi::connect(|_| unsafe {
+        let status = pg_sys::SPI_execute(sql.as_ptr(), true, 0);
+        if status != pg_sys::SPI_OK_SELECT as i32 {
+            pgrx::error!("{failure}: SPI_execute returned {status}");
+        }
+        let table = &*pg_sys::SPI_tuptable;
+        let columns = (*table.tupdesc).natts;
+        (0..pg_sys::SPI_processed as usize)
+            .map(|row| {
+                let tuple = *table.vals.add(row);
+                (1..=columns)
+                    .map(|column| {
+                        let mut is_null = false;
+                        let datum =
+                            pg_sys::SPI_getbinval(tuple, table.tupdesc, column, &mut is_null);
+                        String::from_datum(datum, is_null)
+                    })
+                    .collect()
+            })
+            .collect()
+    })
 }
 
 fn tokenize_documents(
@@ -299,11 +392,15 @@ fn tokenize_documents(
             if row.is_multiple_of(10) {
                 pgrx::check_for_interrupts!();
             }
-            tokenizer
-                .tokenize(document)
-                .map(|token| token.text.into_owned())
-                .collect()
+            tokenize(tokenizer, document)
         })
+        .collect()
+}
+
+fn tokenize(tokenizer: &CompiledTokenizerPipeline, document: &str) -> Vec<String> {
+    tokenizer
+        .tokenize(document)
+        .map(|token| token.text.into_owned())
         .collect()
 }
 
@@ -502,7 +599,95 @@ pub(crate) unsafe fn single_varno(node: *mut pg_sys::Node) -> Option<i32> {
     (binding.valid && binding.seen).then_some(binding.varno)
 }
 
+/// Collects the qual expressions that every output row's entry for `varno`
+/// satisfies, and reports whether `varno` lies under `node`. WHERE and inner
+/// join quals restrict every relation below them. An outer join's ON clause
+/// restricts only its nullable side, since the preserved side keeps its rows
+/// whether or not the clause holds.
+unsafe fn collect_restrictions(
+    node: *mut pg_sys::Node,
+    varno: i32,
+    quals: &mut Vec<*mut pg_sys::Node>,
+) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    unsafe {
+        match (*node).type_ {
+            pg_sys::NodeTag::T_RangeTblRef => {
+                (*node.cast::<pg_sys::RangeTblRef>()).rtindex == varno
+            }
+            pg_sys::NodeTag::T_FromExpr => {
+                let from = &*node.cast::<pg_sys::FromExpr>();
+                let mut contains = false;
+                for child in PgList::<pg_sys::Node>::from_pg(from.fromlist).iter_ptr() {
+                    contains |= collect_restrictions(child, varno, quals);
+                }
+                if contains {
+                    quals.push(from.quals);
+                }
+                contains
+            }
+            pg_sys::NodeTag::T_JoinExpr => {
+                let join = &*node.cast::<pg_sys::JoinExpr>();
+                let left = collect_restrictions(join.larg, varno, quals);
+                let right = collect_restrictions(join.rarg, varno, quals);
+                let restricted = match join.jointype {
+                    pg_sys::JoinType::JOIN_INNER => left || right,
+                    pg_sys::JoinType::JOIN_LEFT => right,
+                    pg_sys::JoinType::JOIN_RIGHT | pg_sys::JoinType::JOIN_SEMI => left,
+                    _ => false,
+                };
+                if restricted {
+                    quals.push(join.quals);
+                }
+                left || right
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Returns the clauses, in the form `predicate_implied_by` compares against an
+/// index predicate, that restrict relation `varno` in `parse`. Scoring
+/// support runs while the target list is preprocessed, before the jointree
+/// quals are simplified, so they are simplified here the way the planner
+/// would. Outer join nulling marks are dropped: a row that a join null-extends
+/// has no document to score or highlight, and every other row carries its
+/// own values.
+unsafe fn restriction_clauses(parse: *mut pg_sys::Query, varno: i32) -> *mut pg_sys::List {
+    unsafe {
+        let mut quals = Vec::new();
+        collect_restrictions((*parse).jointree.cast(), varno, &mut quals);
+        let every_relation = pg_sys::bms_add_range(
+            std::ptr::null_mut(),
+            1,
+            pg_sys::list_length((*parse).rtable),
+        );
+        let mut clauses = std::ptr::null_mut();
+        for qual in quals {
+            if qual.is_null() {
+                continue;
+            }
+            let qual = pg_sys::copyObjectImpl(qual.cast()).cast::<pg_sys::Node>();
+            let qual = pg_sys::remove_nulling_relids(qual, every_relation, std::ptr::null());
+            // Without a planner root, support functions decline to rewrite,
+            // so this cannot reenter scoring support.
+            let qual = pg_sys::eval_const_expressions(std::ptr::null_mut(), qual);
+            let qual = pg_sys::canonicalize_qual(qual.cast(), false);
+            clauses = pg_sys::list_concat(clauses, pg_sys::make_ands_implicit(qual));
+        }
+        clauses
+    }
+}
+
+/// Returns the tin index that scoring and highlighting bind `operand` to, the
+/// way tin selects one: a partial index qualifies only when the query's quals
+/// on the relation imply its predicate. Lead's indexes store no pages, so of
+/// the qualifying indexes the newest partial one wins, then the newest full
+/// one.
 pub(crate) unsafe fn find_matching_tin_index(
+    parse: *mut pg_sys::Query,
     heap_oid: pg_sys::Oid,
     query_varno: i32,
     operand: *mut pg_sys::Node,
@@ -519,7 +704,8 @@ pub(crate) unsafe fn find_matching_tin_index(
     let normalized = unsafe { pg_sys::strip_implicit_coercions(normalized) };
     let heap = unsafe { pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as _) };
     let indexes = unsafe { PgList::<pg_sys::Oid>::from_pg(pg_sys::RelationGetIndexList(heap)) };
-    let mut matched = None;
+    let mut clauses = None;
+    let mut matched: Option<(bool, u32)> = None;
     for index_oid in indexes.iter_oid() {
         let index = unsafe { pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _) };
         let metadata = unsafe { &*(*index).rd_index };
@@ -549,14 +735,108 @@ pub(crate) unsafe fn find_matching_tin_index(
         } else {
             false
         };
+        let predicate = if matches {
+            unsafe { pg_sys::RelationGetIndexPredicate(index) }
+        } else {
+            std::ptr::null_mut()
+        };
+        let partial = !predicate.is_null();
+        let eligible = matches
+            && (!partial
+                || unsafe {
+                    pg_sys::ChangeVarNodes(predicate.cast(), 1, query_varno, 0);
+                    let clauses =
+                        *clauses.get_or_insert_with(|| restriction_clauses(parse, query_varno));
+                    pg_sys::predicate_implied_by(predicate, clauses, false)
+                });
         unsafe { pg_sys::index_close(index, pg_sys::AccessShareLock as _) };
-        if matches {
-            matched = Some(index_oid);
-            break;
+        let choice = (partial, index_oid.to_u32());
+        if eligible && matched.is_none_or(|best| choice > best) {
+            matched = Some(choice);
         }
     }
     unsafe { pg_sys::table_close(heap, pg_sys::AccessShareLock as _) };
-    matched
+    matched.map(|(_, index_oid)| pg_sys::Oid::from(index_oid))
+}
+
+/// Refuses scoring when none of the relation's search expressions has a tin
+/// index to score against, with the error tin raises for the same query.
+unsafe fn refuse_unindexed_scoring(
+    rte: *mut pg_sys::RangeTblEntry,
+    varno: i32,
+    operands: &[*mut pg_sys::Node],
+) -> ! {
+    let expressions = unsafe {
+        let context = pg_sys::deparse_context_for(pg_sys::get_rel_name((*rte).relid), (*rte).relid);
+        operands
+            .iter()
+            .map(|&operand| deparse_search_expression(operand, varno, context))
+            .collect::<Option<Vec<_>>>()
+    };
+    let detail = match expressions {
+        Some(mut expressions) if !expressions.is_empty() => {
+            expressions.sort_unstable();
+            expressions.dedup();
+            format!("No matching tin index for: {}.", expressions.join(", "))
+        }
+        _ => "One or more search expressions have no matching tin index.".to_owned(),
+    };
+    pg_sys::panic::ErrorReport::new(
+        pg_sys::errcodes::PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+        "cannot compute scores for this query",
+        pgrx::function_name!(),
+    )
+    .set_detail(detail)
+    .set_hint("Add a matching USING tin index, or check the definition of an existing index.")
+    .report(pgrx::PgLogLevel::ERROR);
+    unreachable!("ERROR reports do not return")
+}
+
+/// Renders a search expression on relation `varno` against the relation's
+/// own name. Returns `None` for expressions a single-relation deparse context
+/// cannot describe.
+unsafe fn deparse_search_expression(
+    expression: *mut pg_sys::Node,
+    varno: i32,
+    context: *mut pg_sys::List,
+) -> Option<String> {
+    #[pg_guard]
+    unsafe extern "C-unwind" fn prepare(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
+        if node.is_null() {
+            return false;
+        }
+        unsafe {
+            match (*node).type_ {
+                pg_sys::NodeTag::T_Var => {
+                    let var = &mut *node.cast::<pg_sys::Var>();
+                    var.varno = 1;
+                    var.varnosyn = 0;
+                    var.varattnosyn = 0;
+                    var.varnullingrels = std::ptr::null_mut();
+                    false
+                }
+                pg_sys::NodeTag::T_Param => {
+                    (*node.cast::<pg_sys::Param>()).paramkind != pg_sys::ParamKind::PARAM_EXTERN
+                }
+                pg_sys::NodeTag::T_PlaceHolderVar
+                | pg_sys::NodeTag::T_SubLink
+                | pg_sys::NodeTag::T_SubPlan
+                | pg_sys::NodeTag::T_AlternativeSubPlan => true,
+                _ => pg_sys::expression_tree_walker(node, Some(prepare), context),
+            }
+        }
+    }
+    unsafe {
+        if single_varno(expression) != Some(varno) {
+            return None;
+        }
+        let copied = pg_sys::copyObjectImpl(expression.cast()).cast();
+        if prepare(copied, std::ptr::null_mut()) {
+            return None;
+        }
+        let rendered = pg_sys::deparse_expression(copied, context, true, false);
+        Some(CStr::from_ptr(rendered).to_string_lossy().into_owned())
+    }
 }
 
 struct FullScoreBinding {
@@ -579,7 +859,7 @@ unsafe extern "C-unwind" fn has_full_score(node: *mut pg_sys::Node, context: *mu
             if function.funcid == binding.bound {
                 let mode = pg_sys::list_nth(function.args, 4).cast::<pg_sys::Const>();
                 if (*mode).xpr.type_ == pg_sys::NodeTag::T_Const
-                    && (*mode).constvalue.value() == 1
+                    && (*mode).constvalue.value() == ScoreMode::FullScore as usize
                     && pg_sys::equal(pg_sys::list_nth(function.args, 0), binding.document.cast())
                 {
                     return true;
@@ -646,19 +926,32 @@ fn score_support(request: Internal) -> Internal {
         if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
             return unhandled();
         }
+        let searches = binding
+            .matches
+            .iter()
+            .copied()
+            .filter(|&(document, _)| single_varno(document) == Some(ctid.varno))
+            .collect::<Vec<_>>();
+        if searches.is_empty() {
+            return unhandled();
+        }
         let Some((document, first_query, index_oid)) =
-            binding.matches.iter().find_map(|&(document, query)| {
-                find_matching_tin_index((*rte).relid, ctid.varno, document)
+            searches.iter().find_map(|&(document, query)| {
+                find_matching_tin_index(parse, (*rte).relid, ctid.varno, document)
                     .map(|index_oid| (document, query, index_oid))
             })
         else {
-            return unhandled();
+            let operands = searches
+                .iter()
+                .map(|&(document, _)| document)
+                .collect::<Vec<_>>();
+            refuse_unindexed_scoring(rte, ctid.varno, &operands);
         };
         let original_nargs = pg_sys::list_length((*request.fcall).args);
         let function_name = pg_sys::get_func_name((*request.fcall).funcid);
         let fname = CStr::from_ptr(function_name).to_string_lossy();
         let mode = if fname.as_ref() == "full_score" {
-            1
+            ScoreMode::FullScore
         } else if fname.as_ref() == "max_score" {
             let mut binding = FullScoreBinding {
                 ctid,
@@ -672,9 +965,13 @@ fn score_support(request: Internal) -> Internal {
                 (&mut binding as *mut FullScoreBinding).cast(),
                 pg_sys::QTW_IGNORE_RC_SUBQUERIES as i32,
             );
-            if full { 3 } else { 2 }
+            if full {
+                ScoreMode::MaxFullScore
+            } else {
+                ScoreMode::MaxScore
+            }
         } else {
-            0
+            ScoreMode::Score
         };
         let mut args = PgList::<pg_sys::Node>::new();
         args.push(pg_sys::copyObjectImpl(document.cast()).cast());
@@ -687,10 +984,10 @@ fn score_support(request: Internal) -> Internal {
         args.push(make_query_array(&same_expression, first_query));
         args.push(make_int4_const((*rte).relid.to_u32() as i32).cast());
         args.push(make_int4_const(index_oid.to_u32() as i32).cast());
-        args.push(make_int4_const(mode).cast());
+        args.push(make_int4_const(mode as i32).cast());
         let null_float = || make_null_const(pg_sys::FLOAT4OID);
         let null_array = || make_null_const(pg_sys::TEXTARRAYOID);
-        if mode == 0 {
+        if mode == ScoreMode::Score {
             for position in 1..=5 {
                 args.push(
                     pg_sys::copyObjectImpl(
@@ -701,7 +998,7 @@ fn score_support(request: Internal) -> Internal {
             }
         } else {
             args.push(null_float().cast());
-            if mode == 1 && original_nargs == 3 {
+            if mode == ScoreMode::FullScore && original_nargs == 3 {
                 args.push(
                     pg_sys::copyObjectImpl(pg_sys::list_nth((*request.fcall).args, 1).cast())
                         .cast(),
@@ -747,6 +1044,11 @@ unsafe fn make_query_array(
     if elements.is_empty() {
         elements.push(unsafe { pg_sys::copyObjectImpl(first_query.cast()).cast() });
     }
+    unsafe { make_text_array(elements) }
+}
+
+/// Builds a `text[]` expression from `text` expressions.
+pub(crate) unsafe fn make_text_array(elements: PgList<pg_sys::Node>) -> *mut pg_sys::Node {
     let mut array = unsafe { PgBox::<pg_sys::ArrayExpr>::alloc_node(pg_sys::NodeTag::T_ArrayExpr) };
     array.array_typeid = pg_sys::TEXTARRAYOID;
     array.array_collid = pg_sys::DEFAULT_COLLATION_OID;
@@ -786,8 +1088,6 @@ unsafe fn make_null_const(type_oid: pg_sys::Oid) -> *mut pg_sys::Const {
 }
 
 unsafe fn lookup_score_bound() -> pg_sys::Oid {
-    let name = CString::new("tin.score_bound").unwrap();
-    let names = unsafe { pg_sys::stringToQualifiedNameList(name.as_ptr(), std::ptr::null_mut()) };
     let types = [
         pg_sys::TEXTOID,
         pg_sys::TEXTARRAYOID,
@@ -800,12 +1100,21 @@ unsafe fn lookup_score_bound() -> pg_sys::Oid {
         pg_sys::TEXTARRAYOID,
         pg_sys::TEXTARRAYOID,
     ];
+    unsafe { lookup_bound_function(c"tin.score_bound", &types) }
+}
+
+/// Looks up a function that a support function rewrites calls into.
+pub(crate) unsafe fn lookup_bound_function(name: &CStr, types: &[pg_sys::Oid]) -> pg_sys::Oid {
+    let names = unsafe { pg_sys::stringToQualifiedNameList(name.as_ptr(), std::ptr::null_mut()) };
     let oid = unsafe { pg_sys::LookupFuncName(names, types.len() as i32, types.as_ptr(), true) };
     if oid == pg_sys::InvalidOid {
         pgrx::ereport!(
             ERROR,
             pg_sys::errcodes::PgSqlErrorCode::ERRCODE_UNDEFINED_FUNCTION,
-            "tin.score_bound() is missing: the installed tin SQL predates this build",
+            format!(
+                "{}() is missing: the installed tin SQL predates this build",
+                name.to_string_lossy()
+            ),
             "Lead ships no extension upgrade scripts, so the extension has to be \
              reinstalled: DROP EXTENSION tin CASCADE; CREATE EXTENSION tin; \
              CASCADE also drops every tin index and anything else that depends on \

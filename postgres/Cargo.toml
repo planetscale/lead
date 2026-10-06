@@ -25,3 +25,4 @@ boldi-vigna = { path = "../boldi-vigna" }
 
 [dev-dependencies]
 pgrx-tests = "=0.19.1"
+postgres = "0.19"

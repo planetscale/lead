@@ -17,14 +17,48 @@
 #[allow(unused_imports)]
 use crate::am::amhandler;
 use pgrx::{extension_sql, pg_extern};
-use tinql::runtime::{evaluate, lower::lower, subtokenize::sub_tokenize, tokenize_doc};
+use tinql::runtime::{
+    Query, SimplificationProfile, evaluate, lower::lower, simplify, subtokenize::sub_tokenize,
+    tokenize_doc,
+};
+use tokenizer::Tokenizer;
 use tokenizer::presets::default_pipeline;
+
+fn parse_search<T: Tokenizer>(query_text: &str, tokenizer: &T) -> Result<Query, String> {
+    let parsed = tinql::parse(query_text, tinql::ImplicitOp::And).map_err(|e| e.to_string())?;
+    let analyzed = sub_tokenize(parsed, tokenizer).map_err(|e| e.to_string())?;
+    lower(&analyzed).map_err(|e| e.to_string())
+}
+
+fn invalid_search(error: String) -> ! {
+    pgrx::error!("invalid ==> query: {error}")
+}
+
+/// Combines the search texts of several `==>` quals into the query that
+/// scoring and highlighting evaluate. Each text is parsed on its own, so one
+/// text cannot change how another parses, and a text `==>` rejects raises the
+/// error `==>` raises for it. The parsed texts are ORed and simplified the way
+/// lowering simplifies `a OR b`.
+pub(crate) fn parse_searches<T: Tokenizer>(texts: &[String], tokenizer: &T) -> Query {
+    let mut queries = texts
+        .iter()
+        .map(|text| parse_search(text, tokenizer).unwrap_or_else(|error| invalid_search(error)))
+        .collect::<Vec<_>>();
+    if queries.len() == 1 {
+        return queries.remove(0);
+    }
+    simplify(
+        Query::Disjunction {
+            min: 1,
+            children: queries,
+        },
+        SimplificationProfile::Structural,
+    )
+}
 
 fn evaluate_text(document: &str, query_text: &str) -> Result<bool, String> {
     let pipeline = default_pipeline();
-    let parsed = tinql::parse(query_text, tinql::ImplicitOp::And).map_err(|e| e.to_string())?;
-    let analyzed = sub_tokenize(parsed, pipeline).map_err(|e| e.to_string())?;
-    let query = lower(&analyzed).map_err(|e| e.to_string())?;
+    let query = parse_search(query_text, pipeline)?;
     let document = tokenize_doc(document, pipeline);
     evaluate(&query, &document)
         .map(|result| result.matched)
@@ -33,8 +67,7 @@ fn evaluate_text(document: &str, query_text: &str) -> Result<bool, String> {
 
 #[pg_extern(immutable, parallel_safe)]
 pub fn tin_text_cmpfunc(document: &str, query: &str) -> bool {
-    evaluate_text(document, query)
-        .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"))
+    evaluate_text(document, query).unwrap_or_else(|error| invalid_search(error))
 }
 
 extension_sql!(
