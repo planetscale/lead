@@ -19,10 +19,6 @@ use pgrx::{FromDatum, Internal, IntoDatum, PgList, default, pg_extern, pg_guard,
 use std::borrow::Cow;
 use std::ffi::{CStr, c_void};
 
-fn missing_binding(function: &str) -> ! {
-    pgrx::error!("{function} requires an explicit query or a matching tin index scan")
-}
-
 fn render_highlight(
     text: Option<&str>,
     begin_tag: &str,
@@ -30,8 +26,11 @@ fn render_highlight(
     query: Option<&str>,
 ) -> Option<String> {
     let text = text?;
-    let query = query.unwrap_or_else(|| missing_binding("tin.highlight()"));
-    let positions = positions_from_query(query, text);
+    // Without an explicit query or a tin index to bind one from, tin leaves
+    // the text unmarked.
+    let positions = query
+        .map(|query| positions_from_query(query, text))
+        .unwrap_or_default();
     highlight_text(text, begin_tag, end_tag, &positions)
         .map(Some)
         .unwrap_or_else(|error| pgrx::error!("{error}"))
@@ -43,13 +42,14 @@ fn render_highlight_ansi(
     query: Option<&str>,
 ) -> Option<String> {
     let text = text?;
-    let query = query.unwrap_or_else(|| missing_binding("tin.highlight_ansi()"));
     let text = match wrap_to {
         Some(width) if width <= 0 => pgrx::error!("wrap_to must be positive"),
         Some(width) => Cow::Owned(rewrap_text(text, width as usize)),
         None => Cow::Borrowed(text),
     };
-    let positions = positions_from_query(query, text.as_ref());
+    let positions = query
+        .map(|query| positions_from_query(query, text.as_ref()))
+        .unwrap_or_default();
     if positions.is_empty() {
         return Some(text.into_owned());
     }
@@ -318,6 +318,52 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(marked, "alpha <b>zeta</b> filler");
+    }
+
+    #[pg_test]
+    fn highlighting_binds_partial_indexes_like_scoring() {
+        pgrx::Spi::run(
+            "CREATE TABLE lite_highlight_partial (id int, title text, active boolean);
+             INSERT INTO lite_highlight_partial VALUES
+               (1, 'alpha zeta', true), (2, 'alpha < omega', false);
+             CREATE INDEX ON lite_highlight_partial USING tin (title) WHERE active;
+             CREATE TABLE lite_highlight_twin (title text, active boolean);
+             INSERT INTO lite_highlight_twin VALUES ('alpha zeta', false);
+             CREATE INDEX ON lite_highlight_twin USING tin (title) WHERE active;
+             CREATE INDEX ON lite_highlight_twin USING tin (title);",
+        )
+        .unwrap();
+        let highlight = |sql: &str| pgrx::Spi::get_one::<String>(sql).unwrap();
+        assert_eq!(
+            highlight(
+                "SELECT tin.highlight(title) FROM lite_highlight_partial
+                 WHERE active = true AND title ==> 'alpha'"
+            ),
+            Some("<b>alpha</b> zeta".into())
+        );
+        // Like tin, leave the text unmarked when no index can bind a search.
+        for sql in [
+            "SELECT tin.highlight(title) FROM lite_highlight_partial
+             WHERE id = 2 AND title ==> 'alpha'",
+            "SELECT tin.highlight_ansi(title) FROM lite_highlight_partial
+             WHERE id = 2 AND title ==> 'alpha'",
+            "SELECT tin.highlight(title) FROM lite_highlight_partial WHERE id = 2",
+        ] {
+            assert_eq!(highlight(sql), Some("alpha < omega".into()), "{sql}");
+        }
+        assert_eq!(
+            highlight(
+                "SELECT tin.highlight(NULL::text) FROM lite_highlight_partial
+                 WHERE id = 2 AND title ==> 'alpha'"
+            ),
+            None
+        );
+        assert_eq!(
+            highlight(
+                "SELECT tin.highlight(title) FROM lite_highlight_twin WHERE title ==> 'alpha'"
+            ),
+            Some("<b>alpha</b> zeta".into())
+        );
     }
 
     #[pg_test]
