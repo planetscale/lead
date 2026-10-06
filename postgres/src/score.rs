@@ -1222,45 +1222,6 @@ unsafe fn expanded_arguments(function: &pg_sys::FuncExpr) -> *mut pg_sys::List {
     }
 }
 
-/// Reports whether a disjunction in the quals restricting relation `varno`
-/// combines one of its searches with a qual that is not purely searches, as
-/// in `body ==> 'a' OR id = 1`. tin scans such a disjunction with several
-/// scans, and computes no `max_score` for them under the `tin.score`
-/// policy.
-unsafe fn has_mixed_disjunction(parse: *mut pg_sys::Query, varno: i32) -> bool {
-    let is_search = |node| unsafe {
-        crate::operator::search_operands(node)
-            .is_some_and(|(document, _)| single_varno(document) == Some(varno))
-    };
-    let mut mixed = false;
-    let clauses = unsafe { restriction_clauses(parse, varno) };
-    for clause in unsafe { PgList::<pg_sys::Node>::from_pg(clauses) }.iter_ptr() {
-        visit_disjunctions(clause, &mut |arms| {
-            let searches = arms.iter().any(|&arm| {
-                let mut found = false;
-                visit_searches(arm, &mut |node| found |= is_search(node));
-                found
-            });
-            mixed |= searches && !arms.iter().all(|&arm| only_searches(arm, &is_search));
-        });
-    }
-    mixed
-}
-
-/// Reports whether `node` combines nothing but searches with `AND` and `OR`.
-fn only_searches(node: *mut pg_sys::Node, is_search: &impl Fn(*mut pg_sys::Node) -> bool) -> bool {
-    if node.is_null() || is_negation(node) {
-        return false;
-    }
-    if unsafe { (*node).type_ } != pg_sys::NodeTag::T_BoolExpr {
-        return is_search(node);
-    }
-    let expression = unsafe { &*node.cast::<pg_sys::BoolExpr>() };
-    unsafe { PgList::<pg_sys::Node>::from_pg(expression.args) }
-        .iter_ptr()
-        .all(|arm| only_searches(arm, is_search))
-}
-
 #[pg_extern(immutable, parallel_unsafe)]
 fn score_support(request: Internal) -> Internal {
     let unhandled = || Internal::from(Some(pg_sys::Datum::from(0_usize)));
@@ -1354,13 +1315,6 @@ fn score_support(request: Internal) -> Internal {
             "max_score" => ScoreMode::MaxScore,
             _ => ScoreMode::Score,
         };
-        if mode == ScoreMode::MaxScore
-            && (groups.len() > 1 || has_mixed_disjunction(parse, ctid.varno))
-        {
-            return Internal::from(Some(pg_sys::Datum::from(
-                make_null_const(pg_sys::FLOAT4OID) as usize,
-            )));
-        }
         if mode.is_max() {
             mark_required_groups(parse, rte, ctid.varno, &mut groups);
         }
