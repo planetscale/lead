@@ -419,8 +419,8 @@ mod tests {
         Spi::run(
             "CREATE TABLE lite_stale (title text);
              CREATE INDEX ON lite_stale USING tin (title);
-             ALTER FUNCTION tin.score_bound(text, text[], int4, int4, int4,
-               float4, float4, float4, text[], text[]) RENAME TO score_bound_stale;",
+             ALTER FUNCTION tin.score_bound(text[], text[], int4[], int4, int4[], bool[],
+               int4, float4, float4, float4, text[], text[]) RENAME TO score_bound_stale;",
         )
         .unwrap();
         Spi::run("SELECT tin.score(ctid) FROM lite_stale WHERE title ==> 'lorem'").unwrap();
