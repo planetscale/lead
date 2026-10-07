@@ -122,6 +122,10 @@ Every relation operator (except BEFORE and AFTER) has a `NOT` variant:
 | `A ENCLOSED BY B` | `A NOT ENCLOSED BY B` |
 | `A OVERLAPPING B` | `A NOT OVERLAPPING B` |
 
+In a negated relation, B only filters: its terms add nothing to the score, as
+with `AND NOT`. A term that also appears in A, or elsewhere in the query,
+still scores through those occurrences.
+
 ## Combining relations with other operators
 
 When combining relation operators with proximity and positional filters, you

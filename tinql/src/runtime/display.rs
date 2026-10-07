@@ -37,10 +37,12 @@ impl fmt::Display for Query {
                 term_slots,
                 span_query,
                 position_filter,
+                ..
             } => fmt_span_display(f, term_slots, span_query, position_filter.as_ref()),
             Query::SpanExpr {
                 term_slots,
                 span_expr,
+                ..
             } => fmt_span_expr_display(f, term_slots, span_expr),
             Query::MatchAll => write!(f, "*"),
             Query::Regex(pat) => write!(f, "REGEX({pat})"),
@@ -406,7 +408,7 @@ fn fmt_phrase_term(f: &mut fmt::Formatter<'_>, term: &str) -> fmt::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{PositionFilterBound, SpanPositionFilter};
+    use crate::runtime::{PositionFilterBound, SpanLeafBoosts, SpanPositionFilter};
     use boldi_vigna::SpanQuery;
 
     #[test]
@@ -421,6 +423,7 @@ mod tests {
                 inner: Box::new(SpanQuery::Or(vec![SpanQuery::Term(0), SpanQuery::Term(1)])),
             },
             position_filter: None,
+            leaf_boosts: SpanLeafBoosts::default(),
         };
 
         assert_eq!(query.to_string(), "SPAN(MAXWIDTH(7, OR(l.a, nood1e)))");
@@ -443,6 +446,7 @@ mod tests {
                 ])),
             },
             position_filter: None,
+            leaf_boosts: SpanLeafBoosts::default(),
         };
 
         assert_eq!(query.to_string(), r#"PHRASE("big bad wolf")"#);
@@ -463,6 +467,7 @@ mod tests {
                 ])),
             },
             position_filter: None,
+            leaf_boosts: SpanLeafBoosts::default(),
         };
 
         assert_eq!(query.to_string(), r#"PHRASE/2("craft beer")"#);
@@ -483,6 +488,7 @@ mod tests {
                 ])),
             },
             position_filter: None,
+            leaf_boosts: SpanLeafBoosts::default(),
         };
 
         assert_eq!(query.to_string(), r#"PHRASE("say\"hi under\_score")"#);
@@ -516,6 +522,7 @@ mod tests {
                 ])),
             },
             position_filter: None,
+            leaf_boosts: SpanLeafBoosts::default(),
         };
 
         assert_eq!(
@@ -578,6 +585,7 @@ mod tests {
             term_slots: vec![SpanTermSlot::Term("beer".into())],
             span_query: SpanQuery::Term(0),
             position_filter: Some(SpanPositionFilter::Last(PositionFilterBound::Absolute(5))),
+            leaf_boosts: SpanLeafBoosts::default(),
         };
 
         assert_eq!(query.to_string(), "SPAN(beer) IN LAST 5 WORDS");

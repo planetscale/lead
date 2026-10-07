@@ -25,6 +25,7 @@ Boost can be applied to:
 - **Sloppy phrases:** `"big bad"~2^1.5` (slop first, then boost)
 - **Alternatives:** `[IPA ale]^2`
 - **Parenthesized expressions:** `(A NEAR/0 B)^3`
+- **Operands inside a phrase or span:** `ipa^3 NEAR/5 hoppy`, `"craft [beer^2 ale]"`
 
 ## Boost factors
 
@@ -50,6 +51,20 @@ term occurs in multiple branches. For example, `"craft beer"^3 OR (craft NEAR/5
 beer)` gives both terms weight 4 in every matching document, including one that
 matches only the proximity branch. Boosting the phrase provides no separate
 bonus for matching its positions.
+
+A word written more than once inside one phrase or span adds its weight once
+per occurrence too: `"to be or not to be"^2` gives `to` and `be` weight 4 and
+`or` and `not` weight 2. The right side of `NOT ENCLOSES`, `NOT ENCLOSED BY`
+and `NOT OVERLAPPING` only filters, so its terms add no weight.
+
+A boost on an operand inside a phrase or span weighs that operand alone, as it
+would in a Boolean query: `ipa^3 NEAR/5 hoppy` gives `ipa` weight 3 and `hoppy`
+weight 1, like `ipa^3 AND hoppy`. A boost on the whole phrase or span,
+`(ipa NEAR/5 hoppy)^3`, multiplies every operand. A boost on the right side of
+`NOT ENCLOSES`, `NOT ENCLOSED BY` or `NOT OVERLAPPING` adds nothing, because
+that side only filters. As anywhere else, an explicit boost keeps a dense term
+in `tin.score()`, and only that operand's term: in `the THEN/0 ipa^2`, a dense
+`the` is still elided.
 
 ## Boost on hyphenated terms
 

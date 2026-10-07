@@ -21,6 +21,8 @@
 //! - [`SimplificationProfile::Structural`] keeps the old lowering-time work:
 //!   flattening boolean chains, deduplicating flat term siblings, folding
 //!   `MatchAll`, and collapsing one-child boolean nodes
+//! - [`SimplificationProfile::Membership`] adds the rewrites across a
+//!   conjunction's `NOT` children, for match planning only
 //! - [`SimplificationProfile::LogicalUnscored`] adds implication-based
 //!   absorption for positive unscored trees so planner-time display and
 //!   unscored execution can both reuse the same backend-agnostic rewrites
@@ -49,10 +51,14 @@
 //!   space at this boundary, it is just deleting a small set of provably
 //!   redundant unscored subtrees.
 //!
-//! Future work:
-//!
-//! - `NOT` remains a negation boundary. We simplify inside negated subtrees,
-//!   but we don't do implication reasoning across the negative edge yet.
+//! Across the negative edge, a match plan's conjunction (the membership
+//! profiles) is empty when a positive child implies one of its `NOT`
+//! children, and drops the disjuncts they exclude (`exclude_negated`). A
+//! negated subtree itself is simplified inside only. Scoring and highlight
+//! trees keep those children: a row scores and highlights every positive
+//! term it holds, whichever clause matched, so a disjunct no survivor of a
+//! nested conjunction matches still counts on a row that matches through a
+//! sibling of that conjunction.
 
 use super::{Query, SpanExpr, SpanTermSlot};
 use rustc_hash::FxHashSet;
@@ -60,6 +66,9 @@ use rustc_hash::FxHashSet;
 #[derive(Clone, Copy)]
 pub enum SimplificationProfile {
     Structural,
+    /// [`Self::Structural`] for match planning, where the set of rows is
+    /// all that counts: it also rewrites across `NOT` edges.
+    Membership,
     StructuralPreserveTermMultiplicity,
     LogicalUnscored,
 }
@@ -68,6 +77,7 @@ pub fn simplify(query: Query, profile: SimplificationProfile) -> Query {
     let query = normalize_boolean_query(query, profile);
     match profile {
         SimplificationProfile::Structural
+        | SimplificationProfile::Membership
         | SimplificationProfile::StructuralPreserveTermMultiplicity => query,
         SimplificationProfile::LogicalUnscored => reduce_unscored_redundancy(query),
     }
@@ -76,8 +86,17 @@ pub fn simplify(query: Query, profile: SimplificationProfile) -> Query {
 impl SimplificationProfile {
     const fn dedup_flat_terms(self) -> bool {
         match self {
-            Self::Structural | Self::LogicalUnscored => true,
+            Self::Structural | Self::Membership | Self::LogicalUnscored => true,
             Self::StructuralPreserveTermMultiplicity => false,
+        }
+    }
+
+    /// Whether the tree only decides membership, so a conjunction's `NOT`
+    /// children may rewrite its positive ones (`exclude_negated`).
+    const fn crosses_negations(self) -> bool {
+        match self {
+            Self::Membership | Self::LogicalUnscored => true,
+            Self::Structural | Self::StructuralPreserveTermMultiplicity => false,
         }
     }
 }
@@ -299,10 +318,12 @@ fn implies(lhs: &Query, rhs: &Query) -> bool {
             term_slots,
             span_query,
             position_filter,
+            ..
         } => return query_implies_span(lhs, term_slots, span_query, position_filter.as_ref()),
         Query::SpanExpr {
             term_slots,
             span_expr,
+            ..
         } => return query_implies_span_expr(lhs, term_slots, span_expr),
         Query::Disjunction { .. }
         | Query::Not(_)
@@ -352,6 +373,7 @@ fn query_implies_term(query: &Query, rhs_term: &str) -> bool {
         Query::SpanExpr {
             term_slots,
             span_expr,
+            ..
         } => {
             all_terms_required_span_expr(span_expr)
                 && span_expr_references_term(span_expr, term_slots, rhs_term)
@@ -377,6 +399,7 @@ fn query_implies_span(
             term_slots,
             span_query,
             position_filter,
+            ..
         } => {
             term_slots == rhs_slots
                 && span_query == rhs_span_query
@@ -413,6 +436,7 @@ fn query_implies_span_expr(
         Query::SpanExpr {
             term_slots,
             span_expr,
+            ..
         } => term_slots == rhs_slots && span_expr == rhs_span_expr,
         Query::And(left, right) => {
             query_implies_span_expr(left, rhs_slots, rhs_span_expr)
@@ -591,12 +615,58 @@ fn normalize_conjunction(children: Vec<Query>, profile: SimplificationProfile) -
     if flat.iter().any(is_empty_query) {
         return empty_query();
     }
+    if profile.crosses_negations()
+        && let Some(rewritten) = exclude_negated(&mut flat, profile)
+    {
+        return rewritten;
+    }
 
     flat.retain(|child| !matches!(child, Query::MatchAll));
     if profile.dedup_flat_terms() {
         flat = dedup_flat_terms(flat);
     }
     fold_conjunction(flat)
+}
+
+/// The rewrites a conjunction's `NOT` children allow in a match plan: a
+/// positive child that implies a negated one leaves no match, so the
+/// conjunction is empty; and a positive disjunction drops each disjunct
+/// that implies a negated child, which matches no survivor. `None` when
+/// nothing changes.
+///
+/// The disjunct's terms go too, which is what keeps this out of scoring
+/// and highlight trees: a row scores and highlights every positive term it
+/// holds, whichever clause matched (`((a AND c) OR b) AND NOT a` scores `c`
+/// on a survivor holding `b c`), and nested under an OR the conjunction's
+/// rows are not every row the tree scores (`((a OR b) AND NOT a) OR c`
+/// scores `a` on a row holding `a c`).
+fn exclude_negated(flat: &mut Vec<Query>, profile: SimplificationProfile) -> Option<Query> {
+    let negated: Vec<Query> = flat
+        .iter()
+        .filter_map(|child| match child {
+            Query::Not(inner) => Some((**inner).clone()),
+            _ => None,
+        })
+        .collect();
+    if negated.is_empty() {
+        return None;
+    }
+    let excluded = |query: &Query| negated.iter().any(|negated| implies(query, negated));
+    if flat.iter().filter_map(positive_root).any(excluded) {
+        return Some(empty_query());
+    }
+    let mut changed = false;
+    for child in flat.iter_mut() {
+        if let Query::Disjunction { min, children } = child
+            && children.iter().any(excluded)
+        {
+            let (min, mut kept) = (*min, std::mem::take(children));
+            kept.retain(|disjunct| !excluded(disjunct));
+            *child = normalize_disjunction(min, kept, profile);
+            changed = true;
+        }
+    }
+    changed.then(|| normalize_conjunction(std::mem::take(flat), profile))
 }
 
 fn push_conjunction_child(child: Query, out: &mut Vec<Query>) {
@@ -698,6 +768,7 @@ fn fold_conjunction(mut children: Vec<Query>) -> Query {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::SpanLeafBoosts;
 
     #[test]
     fn structural_simplify_flattens_and_dedups_terms() {
@@ -789,6 +860,7 @@ mod tests {
                         ])),
                     },
                     position_filter: None,
+                    leaf_boosts: SpanLeafBoosts::default(),
                 },
             ],
         };
@@ -800,9 +872,9 @@ mod tests {
     }
 
     #[test]
-    fn logical_unscored_does_not_cross_negative_edge() {
+    fn logical_unscored_keeps_negated_subtrees_whole() {
         let query = Query::Conjunction(vec![
-            Query::Term("beer".into()),
+            Query::Term("ale".into()),
             Query::Not(Box::new(Query::Disjunction {
                 min: 1,
                 children: vec![Query::Term("beer".into()), Query::Term("wine".into())],
@@ -810,15 +882,214 @@ mod tests {
         ]);
 
         assert_eq!(
-            simplify(query, SimplificationProfile::LogicalUnscored),
-            Query::Conjunction(vec![
-                Query::Term("beer".into()),
-                Query::Not(Box::new(Query::Disjunction {
-                    min: 1,
-                    children: vec![Query::Term("beer".into()), Query::Term("wine".into())],
-                })),
-            ]),
+            simplify(query.clone(), SimplificationProfile::LogicalUnscored),
+            query,
         );
+    }
+
+    /// The profiles that plan membership, which rewrite across `NOT` edges.
+    const MATCH_PROFILES: [SimplificationProfile; 2] = [
+        SimplificationProfile::Membership,
+        SimplificationProfile::LogicalUnscored,
+    ];
+
+    /// The profiles whose trees score or highlight, which keep every
+    /// positive child.
+    const TREE_PROFILES: [SimplificationProfile; 2] = [
+        SimplificationProfile::Structural,
+        SimplificationProfile::StructuralPreserveTermMultiplicity,
+    ];
+
+    fn term(text: &str) -> Query {
+        Query::Term(text.into())
+    }
+
+    fn not(inner: Query) -> Query {
+        Query::Not(Box::new(inner))
+    }
+
+    fn any(children: Vec<Query>) -> Query {
+        Query::Disjunction { min: 1, children }
+    }
+
+    fn phrase(left: &str, right: &str) -> Query {
+        Query::Span {
+            term_slots: vec![
+                SpanTermSlot::Term(left.into()),
+                SpanTermSlot::Term(right.into()),
+            ],
+            span_query: boldi_vigna::SpanQuery::MaxGaps {
+                max_gaps: 0,
+                inner: Box::new(boldi_vigna::SpanQuery::Ordered(vec![
+                    boldi_vigna::SpanQuery::Term(0),
+                    boldi_vigna::SpanQuery::Term(1),
+                ])),
+            },
+            position_filter: None,
+            leaf_boosts: SpanLeafBoosts::default(),
+        }
+    }
+
+    /// A positive child that implies a negated one leaves no match.
+    #[test]
+    fn a_positive_implying_a_negation_is_empty() {
+        for query in [
+            Query::Conjunction(vec![term("a"), not(term("a"))]),
+            Query::Conjunction(vec![term("a"), term("b"), not(term("a"))]),
+            Query::And(
+                Box::new(Query::Conjunction(vec![term("a"), term("b")])),
+                Box::new(not(term("a"))),
+            ),
+            Query::Conjunction(vec![phrase("a", "b"), not(term("a"))]),
+            Query::Conjunction(vec![term("a"), not(any(vec![term("a"), term("c")]))]),
+            Query::Conjunction(vec![
+                any(vec![term("a"), term("b")]),
+                not(any(vec![term("a"), term("b")])),
+            ]),
+            Query::Conjunction(vec![
+                Query::Boost {
+                    factor: 2.0,
+                    inner: Box::new(term("a")),
+                },
+                not(term("a")),
+            ]),
+        ] {
+            for profile in MATCH_PROFILES {
+                assert_eq!(simplify(query.clone(), profile), empty_query(), "{query:?}");
+            }
+            for profile in TREE_PROFILES {
+                assert_ne!(simplify(query.clone(), profile), empty_query(), "{query:?}");
+            }
+        }
+    }
+
+    /// A disjunct that implies a negated child goes from the match plan,
+    /// whatever else it holds; the threshold's tail then applies.
+    #[test]
+    fn a_disjunct_the_negation_excludes_goes() {
+        let cases = [
+            (
+                Query::Conjunction(vec![any(vec![term("a"), term("b")]), not(term("a"))]),
+                Query::Conjunction(vec![term("b"), not(term("a"))]),
+            ),
+            (
+                Query::Conjunction(vec![
+                    any(vec![term("a"), term("b")]),
+                    not(any(vec![term("a"), term("c")])),
+                ]),
+                Query::Conjunction(vec![term("b"), not(any(vec![term("a"), term("c")]))]),
+            ),
+            (
+                Query::Conjunction(vec![
+                    any(vec![term("a"), term("b"), term("c")]),
+                    not(term("a")),
+                ]),
+                Query::Conjunction(vec![any(vec![term("b"), term("c")]), not(term("a"))]),
+            ),
+            (
+                Query::Conjunction(vec![
+                    Query::Disjunction {
+                        min: 2,
+                        children: vec![term("a"), term("b"), term("c")],
+                    },
+                    not(term("a")),
+                ]),
+                Query::Conjunction(vec![term("b"), term("c"), not(term("a"))]),
+            ),
+            (
+                Query::Conjunction(vec![
+                    Query::Disjunction {
+                        min: 3,
+                        children: vec![term("a"), term("b"), term("c")],
+                    },
+                    not(term("a")),
+                ]),
+                empty_query(),
+            ),
+            (
+                Query::Conjunction(vec![any(vec![phrase("a", "b"), term("c")]), not(term("a"))]),
+                Query::Conjunction(vec![term("c"), not(term("a"))]),
+            ),
+            (
+                Query::Conjunction(vec![
+                    any(vec![
+                        Query::Conjunction(vec![term("a"), term("c")]),
+                        term("b"),
+                    ]),
+                    not(term("a")),
+                ]),
+                Query::Conjunction(vec![term("b"), not(term("a"))]),
+            ),
+        ];
+        for (query, expected) in cases {
+            for profile in MATCH_PROFILES {
+                assert_eq!(simplify(query.clone(), profile), expected, "{query:?}");
+            }
+            for profile in TREE_PROFILES {
+                assert_ne!(simplify(query.clone(), profile), expected, "{query:?}");
+            }
+        }
+        // The profile that keeps repeats keeps a repeated disjunct too.
+        let repeated = Query::Conjunction(vec![
+            any(vec![term("a"), term("a"), term("b")]),
+            not(term("a")),
+        ]);
+        assert_eq!(
+            simplify(
+                repeated.clone(),
+                SimplificationProfile::StructuralPreserveTermMultiplicity
+            ),
+            repeated,
+        );
+    }
+
+    /// Nested under an OR, the rewritten conjunction's rows are not every
+    /// row the tree matches: a row holding `a c` matches through `c` and
+    /// scores and highlights `a`. The match plan still rewrites it (its rows
+    /// are the same); the trees keep it whole.
+    #[test]
+    fn a_nested_negation_rewrites_the_match_plan_only() {
+        let cases = [
+            (
+                any(vec![
+                    Query::Conjunction(vec![any(vec![term("a"), term("b")]), not(term("a"))]),
+                    term("c"),
+                ]),
+                any(vec![
+                    Query::Conjunction(vec![term("b"), not(term("a"))]),
+                    term("c"),
+                ]),
+            ),
+            (
+                any(vec![
+                    Query::Conjunction(vec![term("a"), not(term("a"))]),
+                    term("c"),
+                ]),
+                term("c"),
+            ),
+        ];
+        for (query, expected) in cases {
+            for profile in MATCH_PROFILES {
+                assert_eq!(simplify(query.clone(), profile), expected, "{query:?}");
+            }
+            for profile in TREE_PROFILES {
+                assert_eq!(simplify(query.clone(), profile), query, "{query:?}");
+            }
+        }
+    }
+
+    /// No rewrite where nothing implies the negation.
+    #[test]
+    fn a_negation_rewrites_nothing_it_does_not_exclude() {
+        for query in [
+            Query::Conjunction(vec![term("a"), not(phrase("a", "b"))]),
+            Query::Conjunction(vec![any(vec![term("a"), term("b")]), not(term("c"))]),
+            Query::Conjunction(vec![any(vec![term("b"), not(term("a"))]), not(term("a"))]),
+        ] {
+            for profile in MATCH_PROFILES.into_iter().chain(TREE_PROFILES) {
+                assert_eq!(simplify(query.clone(), profile), query, "{query:?}");
+            }
+        }
     }
 
     #[test]
@@ -833,6 +1104,7 @@ mod tests {
                     ],
                     span_query: boldi_vigna::SpanQuery::Term(0),
                     position_filter: None,
+                    leaf_boosts: SpanLeafBoosts::default(),
                 },
                 Query::Term("c".into()),
             ],
@@ -850,6 +1122,7 @@ mod tests {
                         ],
                         span_query: boldi_vigna::SpanQuery::Term(0),
                         position_filter: None,
+                        leaf_boosts: SpanLeafBoosts::default(),
                     },
                     Query::Term("c".into()),
                 ],

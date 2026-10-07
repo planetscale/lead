@@ -21,7 +21,11 @@
 //! [`MAX_NESTING_DEPTH`] with SQLSTATE 54000 (`program_limit_exceeded`) before
 //! the parser runs.
 
-use ::tinql::runtime::{Query, QueryError, lower::lower, subtokenize::sub_tokenize};
+use ::tinql::runtime::{
+    Query, QueryError, SimplificationProfile,
+    lower::{lower, lower_with_profile},
+    subtokenize::sub_tokenize,
+};
 use tokenizer::Tokenizer;
 
 /// Longest accepted TINQL query text, in bytes.
@@ -73,4 +77,16 @@ pub(crate) fn parse_tinql_to_query<T: Tokenizer>(
     tokenizer: &T,
 ) -> Result<Query, QueryError> {
     Ok(lower(&sub_tokenize(parse(query)?, tokenizer)?)?)
+}
+
+/// Like [`parse_tinql_to_query`], but keeps every written occurrence of a
+/// repeated term, which is what scoring weighs.
+pub(crate) fn parse_scoring_tinql_to_query<T: Tokenizer>(
+    query: &str,
+    tokenizer: &T,
+) -> Result<Query, QueryError> {
+    Ok(lower_with_profile(
+        &sub_tokenize(parse(query)?, tokenizer)?,
+        SimplificationProfile::StructuralPreserveTermMultiplicity,
+    )?)
 }
