@@ -35,3 +35,5 @@ highlight_expression_analysis
 highlight_having_analysis
 highlight_join_analysis
 highlight_null_analysis_defaults
+phrase_repeat_weights
+tinql_query_length_limit

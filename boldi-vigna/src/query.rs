@@ -174,6 +174,40 @@ impl SpanQuery {
         SpanQueryWithTerms { query: self, terms }
     }
 
+    /// Calls `f` with the index of every `Term` leaf outside an excluded
+    /// operand, once per occurrence, left to right. An excluded operand
+    /// (`NotContaining`'s `little`, `NotContainedBy`'s `big`,
+    /// `NonOverlapping`'s `b`) only filters its sibling's spans, so no leaf
+    /// beneath it is visited.
+    pub fn for_each_positive_term(&self, f: &mut impl FnMut(usize)) {
+        match self {
+            SpanQuery::Empty => {}
+            SpanQuery::Term(i) => f(*i),
+            SpanQuery::Ordered(children)
+            | SpanQuery::Unordered(children)
+            | SpanQuery::Or(children) => {
+                for child in children {
+                    child.for_each_positive_term(f);
+                }
+            }
+            SpanQuery::MaxGaps { inner, .. }
+            | SpanQuery::GapsInRange { inner, .. }
+            | SpanQuery::MaxWidth { inner, .. }
+            | SpanQuery::WithinPositions { inner, .. }
+            | SpanQuery::NotContaining { big: inner, .. }
+            | SpanQuery::NotContainedBy { little: inner, .. }
+            | SpanQuery::NonOverlapping { a: inner, .. } => inner.for_each_positive_term(f),
+            SpanQuery::Containing { big: a, little: b }
+            | SpanQuery::ContainedBy { little: a, big: b }
+            | SpanQuery::Overlapping { a, b }
+            | SpanQuery::Before { a, b }
+            | SpanQuery::After { a, b } => {
+                a.for_each_positive_term(f);
+                b.for_each_positive_term(f);
+            }
+        }
+    }
+
     /// Maximum term index referenced anywhere in this query tree.
     pub fn max_term_index(&self) -> Option<usize> {
         match self {
@@ -196,6 +230,30 @@ impl SpanQuery {
             | SpanQuery::NonOverlapping { a, b }
             | SpanQuery::Before { a, b }
             | SpanQuery::After { a, b } => max_opt(a.max_term_index(), b.max_term_index()),
+        }
+    }
+
+    /// Whether an `Unordered` sits anywhere in this query tree: the operator
+    /// whose gap-read form walks every child order (`NodeState::compile_gaps`).
+    pub(crate) fn holds_unordered(&self) -> bool {
+        match self {
+            SpanQuery::Unordered(_) => true,
+            SpanQuery::Empty | SpanQuery::Term(_) => false,
+            SpanQuery::Ordered(children) | SpanQuery::Or(children) => {
+                children.iter().any(SpanQuery::holds_unordered)
+            }
+            SpanQuery::MaxGaps { inner, .. }
+            | SpanQuery::GapsInRange { inner, .. }
+            | SpanQuery::MaxWidth { inner, .. }
+            | SpanQuery::WithinPositions { inner, .. } => inner.holds_unordered(),
+            SpanQuery::Containing { big: a, little: b }
+            | SpanQuery::NotContaining { big: a, little: b }
+            | SpanQuery::ContainedBy { little: a, big: b }
+            | SpanQuery::NotContainedBy { little: a, big: b }
+            | SpanQuery::Overlapping { a, b }
+            | SpanQuery::NonOverlapping { a, b }
+            | SpanQuery::Before { a, b }
+            | SpanQuery::After { a, b } => a.holds_unordered() || b.holds_unordered(),
         }
     }
 
@@ -290,6 +348,31 @@ mod tests {
     fn validate_too_few_children() {
         let q = SpanQuery::Ordered(vec![SpanQuery::Term(0)]);
         assert!(q.validate(1).is_err());
+    }
+
+    #[test]
+    fn positive_terms_repeat_and_skip_excluded_operands() {
+        let mut leaves = Vec::new();
+        let q = SpanQuery::NotContaining {
+            big: Box::new(SpanQuery::phrase([0, 1, 0])),
+            little: Box::new(SpanQuery::Term(2)),
+        };
+        q.for_each_positive_term(&mut |idx| leaves.push(idx));
+        assert_eq!(leaves, [0, 1, 0]);
+
+        leaves.clear();
+        let q = SpanQuery::Containing {
+            big: Box::new(SpanQuery::NonOverlapping {
+                a: Box::new(SpanQuery::Term(0)),
+                b: Box::new(SpanQuery::Term(1)),
+            }),
+            little: Box::new(SpanQuery::NotContainedBy {
+                little: Box::new(SpanQuery::Or(vec![SpanQuery::Term(0), SpanQuery::Term(2)])),
+                big: Box::new(SpanQuery::Term(3)),
+            }),
+        };
+        q.for_each_positive_term(&mut |idx| leaves.push(idx));
+        assert_eq!(leaves, [0, 0, 2]);
     }
 
     #[test]

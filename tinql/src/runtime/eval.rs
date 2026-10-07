@@ -211,6 +211,7 @@ fn evaluate_searchable(query: &Query, doc: &TokenizedDoc) -> Result<MatchResult,
             term_slots,
             span_query,
             position_filter,
+            ..
         } => {
             let positions = term_slots
                 .iter()
@@ -232,6 +233,7 @@ fn evaluate_searchable(query: &Query, doc: &TokenizedDoc) -> Result<MatchResult,
         Query::SpanExpr {
             term_slots,
             span_expr,
+            ..
         } => {
             let positions = term_slots
                 .iter()
@@ -369,6 +371,7 @@ fn collect_highlight_matches(query: &Query, doc: &TokenizedDoc, out: &mut Vec<Hi
             term_slots,
             span_query,
             position_filter,
+            ..
         } => {
             let positions = term_slots
                 .iter()
@@ -395,6 +398,7 @@ fn collect_highlight_matches(query: &Query, doc: &TokenizedDoc, out: &mut Vec<Hi
         Query::SpanExpr {
             term_slots,
             span_expr,
+            ..
         } => {
             let positions = term_slots
                 .iter()
