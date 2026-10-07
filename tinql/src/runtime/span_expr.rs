@@ -150,6 +150,66 @@ impl SpanExpr {
         }
     }
 
+    /// Calls `f` with the slot of every `Term` leaf outside an excluded
+    /// operand, once per occurrence, left to right: the leaves a match's
+    /// spans are built from ([`Self::for_each_term`]).
+    pub fn for_each_positive_term(&self, f: &mut impl FnMut(usize)) {
+        self.for_each_term(true, &mut |idx, included| {
+            if included {
+                f(idx);
+            }
+        });
+    }
+
+    /// Calls `f` with the slot of every `Term` leaf, once per occurrence, left
+    /// to right, and whether it is included (`included` seeds the root). An
+    /// excluded operand (`NotContaining`'s `little`, `NotContainedBy`'s
+    /// `big`, `NonOverlapping`'s `b`) only filters its sibling's spans, so
+    /// every leaf beneath it is excluded. Left to right is the order lowering
+    /// writes the leaves in.
+    pub(super) fn for_each_term(&self, included: bool, f: &mut impl FnMut(usize, bool)) {
+        match self {
+            Self::Empty => {}
+            Self::Term(idx) => f(*idx, included),
+            Self::Ordered(children)
+            | Self::Unordered(children)
+            | Self::Or(children)
+            | Self::AtLeast { children, .. } => {
+                for child in children {
+                    child.for_each_term(included, f);
+                }
+            }
+            Self::MaxGaps { inner, .. }
+            | Self::GapsInRange { inner, .. }
+            | Self::MaxWidth { inner, .. }
+            | Self::WithinPositions { inner, .. }
+            | Self::PositionFilter { inner, .. } => inner.for_each_term(included, f),
+            Self::NotContaining {
+                big: kept,
+                little: excluded,
+            }
+            | Self::NotContainedBy {
+                little: kept,
+                big: excluded,
+            }
+            | Self::NonOverlapping {
+                a: kept,
+                b: excluded,
+            } => {
+                kept.for_each_term(included, f);
+                excluded.for_each_term(false, f);
+            }
+            Self::Containing { big: a, little: b }
+            | Self::ContainedBy { little: a, big: b }
+            | Self::Overlapping { a, b }
+            | Self::Before { a, b }
+            | Self::After { a, b } => {
+                a.for_each_term(included, f);
+                b.for_each_term(included, f);
+            }
+        }
+    }
+
     pub fn to_fast_path_root(
         &self,
     ) -> Option<(boldi_vigna::SpanQuery, Option<SpanPositionFilter>)> {

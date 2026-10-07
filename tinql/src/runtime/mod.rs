@@ -67,10 +67,12 @@ pub enum Query {
         term_slots: Vec<SpanTermSlot>,
         span_query: boldi_vigna::SpanQuery,
         position_filter: Option<SpanPositionFilter>,
+        leaf_boosts: SpanLeafBoosts,
     },
     SpanExpr {
         term_slots: Vec<SpanTermSlot>,
         span_expr: SpanExpr,
+        leaf_boosts: SpanLeafBoosts,
     },
     MatchAll,
     Regex(CompiledRegex),
@@ -111,6 +113,21 @@ pub enum SpanTermSlot {
     },
 }
 
+/// The `^` factor written on each included leaf of a span, in
+/// [`SpanExpr::for_each_positive_term`] order: the product of the boosts
+/// between the leaf and the span's root, `None` where there are none. Empty
+/// when no included leaf is boosted, so an unboosted span lowers as it always
+/// has. Only scoring reads it; matching never does.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpanLeafBoosts(Box<[Option<f32>]>);
+
+impl SpanLeafBoosts {
+    /// The boost written on the `nth` included leaf.
+    fn get(&self, nth: usize) -> Option<f32> {
+        if self.0.is_empty() { None } else { self.0[nth] }
+    }
+}
+
 /// A bound in a term range expression.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RangeBound {
@@ -137,6 +154,36 @@ impl Query {
             Query::Disjunction { children, .. } => children.iter().any(Query::has_positive),
             Query::Boost { inner, .. } => inner.has_positive(),
             Query::AtLeast { children, .. } => children.iter().any(|c| c.has_positive()),
+        }
+    }
+
+    /// For a span node (`Span` or `SpanExpr`), calls `f` with each included
+    /// leaf's slot index, slot and written boost ([`SpanLeafBoosts`]), once
+    /// per written occurrence, left to right
+    /// ([`SpanExpr::for_each_positive_term`]); nothing for any other node.
+    /// These are the leaves a span scores: its excluded sides only filter.
+    pub fn for_each_positive_span_slot<'a>(
+        &'a self,
+        f: &mut impl FnMut(usize, &'a SpanTermSlot, Option<f32>),
+    ) {
+        let mut nth = 0;
+        let mut visit = |term_slots: &'a [SpanTermSlot], leaf_boosts: &SpanLeafBoosts, idx| {
+            f(idx, &term_slots[idx], leaf_boosts.get(nth));
+            nth += 1;
+        };
+        match self {
+            Query::Span {
+                term_slots,
+                span_query,
+                leaf_boosts,
+                ..
+            } => span_query.for_each_positive_term(&mut |idx| visit(term_slots, leaf_boosts, idx)),
+            Query::SpanExpr {
+                term_slots,
+                span_expr,
+                leaf_boosts,
+            } => span_expr.for_each_positive_term(&mut |idx| visit(term_slots, leaf_boosts, idx)),
+            _ => {}
         }
     }
 

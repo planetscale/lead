@@ -18,7 +18,7 @@ use crate::bm25::{
     Bm25Overrides, DenseRatio, ScoreStopWords, ScoringTermInput, TermScorer, TermSetEdit,
     compile_scoring_terms, sum_scores_in_order,
 };
-use crate::tinql::parse_tinql_to_query;
+use crate::tinql::parse_scoring_tinql_to_query;
 use pgrx::iter::TableIterator;
 use pgrx::{
     FromDatum, Internal, IntoDatum, PgBox, PgList, PgMemoryContexts, PgRelation, Spi, default,
@@ -363,8 +363,9 @@ fn build_group<'a>(
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
     let query = crate::operator::parse_searches(queries, &tokenizer);
+    let scoring_query = crate::operator::parse_scoring_searches(queries, &tokenizer);
     let mut inputs = Vec::new();
-    collect_score_terms(&query, 1.0, false, &mut inputs);
+    collect_score_terms(&scoring_query, 1.0, false, &mut inputs);
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("tin.score(): {error}"))
         .analyzed_with(|text| {
@@ -541,12 +542,16 @@ fn collect_score_terms<'a>(
     };
     match query {
         Query::Term(text) | Query::Fuzzy { term: text, .. } => push(text),
-        Query::Span { term_slots, .. } | Query::SpanExpr { term_slots, .. } => {
-            for slot in term_slots {
+        Query::Span { .. } | Query::SpanExpr { .. } => {
+            query.for_each_positive_span_slot(&mut |_, slot, leaf_boost| {
                 if let SpanTermSlot::Term(text) | SpanTermSlot::Fuzzy { term: text, .. } = slot {
-                    push(text);
+                    out.push(ScoringTermInput {
+                        text,
+                        boost: boost * leaf_boost.unwrap_or(1.0),
+                        explicitly_boosted: explicitly_boosted || leaf_boost.is_some(),
+                    });
                 }
-            }
+            });
         }
         Query::And(left, right) | Query::Or(left, right) => {
             collect_score_terms(left, boost, explicitly_boosted, out);
@@ -609,7 +614,7 @@ fn score_inspect(
         };
     }
     let tokenizer = unsafe { crate::options::tokenizer(index.as_ptr()) };
-    let parsed = parse_tinql_to_query(query, &tokenizer)
+    let parsed = parse_scoring_tinql_to_query(query, &tokenizer)
         .unwrap_or_else(|error| pgrx::error!("tin.score_inspect() query error: {error}"));
     let mut inputs = Vec::new();
     collect_score_terms(&parsed, 1.0, false, &mut inputs);

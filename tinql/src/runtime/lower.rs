@@ -29,7 +29,7 @@ use rustc_hash::FxHashMap;
 
 use super::{
     CompiledRegex, PositionFilterBound, Query, RangeBound, SimplificationProfile, SpanExpr,
-    SpanPositionFilter, SpanTermSlot, simplify,
+    SpanLeafBoosts, SpanPositionFilter, SpanTermSlot, simplify,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -137,84 +137,95 @@ fn lower_boolean(expr: &crate::Expr) -> Result<Query, LowerError> {
 }
 
 fn lower_as_span(expr: &crate::Expr) -> Result<Query, LowerError> {
-    let mut builder = SpanBuilder::new();
+    let mut builder = SpanBuilder::default();
     let span_expr = builder.lower_span_expr(expr)?;
+    let leaf_boosts = builder.leaf_boosts(&span_expr);
     if let Some((span_query, position_filter)) = span_expr.to_fast_path_root() {
         Ok(Query::Span {
             term_slots: builder.term_slots,
             span_query,
             position_filter,
+            leaf_boosts,
         })
     } else {
         Ok(Query::SpanExpr {
             term_slots: builder.term_slots,
             span_expr,
+            leaf_boosts,
         })
     }
 }
 
+#[derive(Default)]
 struct SpanBuilder {
     term_slots: Vec<SpanTermSlot>,
     intern_map: FxHashMap<SpanTermSlot, usize>,
+    /// The product of the `^` factors around the operand being lowered.
+    boost: Option<f32>,
+    /// `boost` at each leaf, in the order the leaves are lowered.
+    written_boosts: Vec<Option<f32>>,
 }
 
 impl SpanBuilder {
-    fn new() -> Self {
-        Self {
-            term_slots: Vec::new(),
-            intern_map: FxHashMap::default(),
-        }
+    /// One written occurrence of `slot`, under the current boost. Every
+    /// occurrence of a slot shares its interned index.
+    fn leaf(&mut self, slot: SpanTermSlot) -> SpanExpr {
+        self.written_boosts.push(self.boost);
+        let term_slots = &mut self.term_slots;
+        let idx = *self.intern_map.entry(slot).or_insert_with_key(|slot| {
+            term_slots.push(slot.clone());
+            term_slots.len() - 1
+        });
+        SpanExpr::Term(idx)
     }
 
-    fn intern(&mut self, slot: SpanTermSlot) -> usize {
-        if let Some(&idx) = self.intern_map.get(&slot) {
-            return idx;
+    /// The written boosts of the leaves `span_expr` scores. Lowering writes
+    /// leaves in the tree's left-to-right order, the order `for_each_term`
+    /// walks, so the two line up one for one.
+    fn leaf_boosts(&self, span_expr: &SpanExpr) -> SpanLeafBoosts {
+        let mut written = self.written_boosts.iter();
+        let mut included = Vec::new();
+        span_expr.for_each_term(true, &mut |_, scored| {
+            let boost = written.next().expect("lowering writes a boost per leaf");
+            if scored {
+                included.push(*boost);
+            }
+        });
+        debug_assert!(
+            written.next().is_none(),
+            "every written leaf is in the tree"
+        );
+        if included.iter().all(Option::is_none) {
+            SpanLeafBoosts::default()
+        } else {
+            SpanLeafBoosts(included.into())
         }
-        let idx = self.term_slots.len();
-        self.intern_map.insert(slot.clone(), idx);
-        self.term_slots.push(slot);
-        idx
     }
 
     fn lower_span_expr(&mut self, expr: &crate::Expr) -> Result<SpanExpr, LowerError> {
         use crate::Expr;
 
         match expr {
-            Expr::Term(s) => {
-                let idx = self.intern(SpanTermSlot::Term(s.clone()));
-                Ok(SpanExpr::Term(idx))
-            }
+            Expr::Term(s) => Ok(self.leaf(SpanTermSlot::Term(s.clone()))),
             Expr::MatchAll => Err(LowerError::MatchAllInSpanContext),
             Expr::MatchNone => Ok(SpanExpr::Empty),
             Expr::Fuzzy {
                 term,
                 prefix,
                 distance,
-            } => {
-                let idx = self.intern(SpanTermSlot::Fuzzy {
-                    term: term.clone(),
-                    prefix: *prefix,
-                    distance: *distance,
-                });
-                Ok(SpanExpr::Term(idx))
-            }
-            Expr::Wildcard(parts) => {
-                let idx = self.intern(SpanTermSlot::Regex(CompiledRegex::new(
-                    &wildcard_parts_regex(parts),
-                )?));
-                Ok(SpanExpr::Term(idx))
-            }
-            Expr::Regex(pat) => {
-                let idx = self.intern(SpanTermSlot::Regex(CompiledRegex::new(pat)?));
-                Ok(SpanExpr::Term(idx))
-            }
-            Expr::Range { lower, upper } => {
-                let idx = self.intern(SpanTermSlot::Range {
-                    lower: convert_range_bound(lower),
-                    upper: convert_range_bound(upper),
-                });
-                Ok(SpanExpr::Term(idx))
-            }
+            } => Ok(self.leaf(SpanTermSlot::Fuzzy {
+                term: term.clone(),
+                prefix: *prefix,
+                distance: *distance,
+            })),
+            Expr::Wildcard(parts) => Ok(self.leaf(SpanTermSlot::Regex(CompiledRegex::new(
+                &wildcard_parts_regex(parts),
+            )?))),
+            Expr::Regex(pat) => Ok(self.leaf(SpanTermSlot::Regex(CompiledRegex::new(pat)?))),
+            Expr::Range { lower, upper } => Ok(self.leaf(SpanTermSlot::Range {
+                lower: convert_range_bound(lower),
+                upper: convert_range_bound(upper),
+            })),
             Expr::Phrase { elements, slop } => self.lower_phrase(elements, *slop),
             Expr::And(l, r) => {
                 let left = self.lower_span_expr(l)?;
@@ -352,7 +363,15 @@ impl SpanBuilder {
                     inner: Box::new(sq),
                 })
             }
-            Expr::Boost { inner, .. } => self.lower_span_expr(inner),
+            // The factor stays out of the tree: it weighs the leaves beneath
+            // it (`leaf_boosts`), and matching never sees it.
+            Expr::Boost { factor, inner } => {
+                let outer = self.boost;
+                self.boost = Some(outer.unwrap_or(1.0) * factor.0);
+                let lowered = self.lower_span_expr(inner);
+                self.boost = outer;
+                lowered
+            }
         }
     }
 
@@ -370,8 +389,7 @@ impl SpanBuilder {
         for elem in elements {
             match elem {
                 crate::PhraseElement::Term(s) => {
-                    let idx = self.intern(SpanTermSlot::Term(s.clone()));
-                    children.push((pending_gap, SpanExpr::Term(idx)));
+                    children.push((pending_gap, self.leaf(SpanTermSlot::Term(s.clone()))));
                     pending_gap = 0;
                 }
                 crate::PhraseElement::Gap(n) => {
@@ -486,6 +504,129 @@ mod tests {
         let expr = super::super::subtokenize::sub_tokenize(parse(input), default_pipeline())
             .expect("query should sub-tokenize");
         lower(&expr).expect("query should lower")
+    }
+
+    /// The slots of a lowered span's included leaves, one per written
+    /// occurrence, left to right.
+    fn positive_leaves(input: &str) -> Vec<String> {
+        let query = parse_and_lower(input);
+        let mut leaves = Vec::new();
+        let term_slots = match &query {
+            Query::Span {
+                term_slots,
+                span_query,
+                ..
+            } => {
+                span_query.for_each_positive_term(&mut |idx| leaves.push(idx));
+                term_slots
+            }
+            Query::SpanExpr {
+                term_slots,
+                span_expr,
+                ..
+            } => {
+                span_expr.for_each_positive_term(&mut |idx| leaves.push(idx));
+                term_slots
+            }
+            other => panic!("{input} lowers to {other:?}, not a span"),
+        };
+        leaves
+            .into_iter()
+            .map(|idx| match &term_slots[idx] {
+                SpanTermSlot::Term(term) => term.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn span_positive_leaves_are_written_occurrences_outside_excluded_sides() {
+        let to_be = ["to", "be", "or", "not", "to", "be"];
+        assert_eq!(positive_leaves("\"to be or not to be\""), to_be);
+        assert_eq!(positive_leaves("\"to be or not to be\"~2"), to_be);
+        assert_eq!(positive_leaves("be NEAR/1 be"), ["be", "be"]);
+        assert_eq!(positive_leaves("[be or] NEAR/1 be"), ["be", "or", "be"]);
+        assert_eq!(
+            positive_leaves("(AT LEAST 2 OF [be be or]) NEAR/3 to"),
+            ["be", "be", "or", "to"]
+        );
+        assert_eq!(
+            positive_leaves("(to NEAR/3 not) NOT ENCLOSES be"),
+            ["to", "not"]
+        );
+        assert_eq!(
+            positive_leaves("or NOT ENCLOSED BY \"to be or not\""),
+            ["or"]
+        );
+        assert_eq!(positive_leaves("be NOT OVERLAPPING \"to be\""), ["be"]);
+        assert_eq!(positive_leaves("(be AND NOT or) NEAR/3 to"), ["be", "to"]);
+        assert_eq!(
+            positive_leaves("(be NEAR/3 be) NOT ENCLOSES (or NEAR/1 be)"),
+            ["be", "be"]
+        );
+    }
+
+    /// A lowered span's included leaves as scoring reads them, left to right:
+    /// `term^factor` for a leaf with a written boost.
+    fn boosted_leaves(query: &Query) -> Vec<String> {
+        let mut leaves = Vec::new();
+        query.for_each_positive_span_slot(&mut |_, slot, boost| {
+            let SpanTermSlot::Term(term) = slot else {
+                panic!("{slot:?} is not a term slot");
+            };
+            leaves.push(match boost {
+                Some(factor) => format!("{term}^{factor}"),
+                None => term.clone(),
+            });
+        });
+        leaves
+    }
+
+    #[test]
+    fn span_leaf_boosts_weigh_the_operand_they_are_written_on() {
+        let leaves = |input| boosted_leaves(&parse_and_lower(input));
+        assert_eq!(leaves("ipa^3 NEAR/5 hoppy"), ["ipa^3", "hoppy"]);
+        assert_eq!(leaves("\"craft [beer^2 ale]\""), ["craft", "beer^2", "ale"]);
+        assert_eq!(
+            leaves("(stout^2 OR porter) NEAR/3 chocolate"),
+            ["stout^2", "porter", "chocolate"]
+        );
+        assert_eq!(leaves("beer^2 IN FIRST 100 WORDS"), ["beer^2"]);
+        assert_eq!(leaves("beer^0 NEAR/3 tasting"), ["beer^0", "tasting"]);
+        // Factors multiply down to the leaf; a repeated word weighs per
+        // occurrence, each with its own boost.
+        assert_eq!(
+            leaves("(ipa^2 NEAR/1 pale)^3 THEN/4 ale"),
+            ["ipa^6", "pale^3", "ale"]
+        );
+        assert_eq!(leaves("beer^2 NEAR/3 beer"), ["beer^2", "beer"]);
+        // An excluded side only filters: its boosts weigh nothing.
+        assert_eq!(
+            leaves("(ipa^2 NEAR/3 hoppy) NOT ENCLOSES stout^5"),
+            ["ipa^2", "hoppy"]
+        );
+        // The dynamic form (AT LEAST has no fast path) reads them the same way.
+        let at_least = parse_and_lower("(AT LEAST 2 OF [be^2 be or]) NEAR/3 to");
+        assert!(matches!(at_least, Query::SpanExpr { .. }));
+        assert_eq!(boosted_leaves(&at_least), ["be^2", "be", "or", "to"]);
+    }
+
+    #[test]
+    fn unboosted_span_leaves_lower_without_boosts() {
+        let unboosted = |input| match parse_and_lower(input) {
+            Query::Span { leaf_boosts, .. } | Query::SpanExpr { leaf_boosts, .. } => {
+                leaf_boosts == SpanLeafBoosts::default()
+            }
+            Query::Boost { inner, .. } => matches!(
+                *inner,
+                Query::Span { leaf_boosts, .. } if leaf_boosts == SpanLeafBoosts::default()
+            ),
+            other => panic!("{input} lowers to {other:?}"),
+        };
+        assert!(unboosted("ipa NEAR/5 hoppy"));
+        assert!(unboosted("(ipa NEAR/5 hoppy)^3"));
+        assert!(unboosted("\"craft beer\"^2"));
+        assert!(unboosted("ipa NOT ENCLOSES stout^5"));
     }
 
     #[test]
@@ -665,6 +806,7 @@ mod tests {
         let Query::SpanExpr {
             term_slots,
             span_expr,
+            ..
         } = query
         else {
             panic!("expected advanced span expression lowering");

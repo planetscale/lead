@@ -77,6 +77,24 @@ When the percentage does not divide evenly, the required count rounds up:
 
 Place `%` immediately after the number.
 
+### Repeated alternatives
+
+Each listed alternative counts on its own, even when two are the same
+expression:
+
+```
+AT LEAST 2 OF [beer beer wine]
+```
+
+A document that contains only "beer" matches, because it satisfies two of
+the three listed alternatives. A percentage counts repeats in the list
+length too, so `AT LEAST 50% OF [beer beer wine ale]` requires 2.
+
+### Thresholds outside the list
+
+`AT LEAST 0 OF [...]` matches every document. A threshold larger than the
+list, such as `AT LEAST 4 OF [a b c]`, matches no document.
+
 ### Syntax
 
 ```

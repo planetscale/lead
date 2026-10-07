@@ -108,6 +108,10 @@ of "IPA", "stout", or "lager".
 Either "beer" or "ale" within 10 extra positions of either "food" or "dinner",
 in any order.
 
+Each operand matches at its own position: one occurrence of a word can't
+satisfy two operands. `alpha NEAR/3 alpha` needs two occurrences of "alpha",
+and `alpha NEAR/0 [alpha beta]` matches "alpha beta" through "beta".
+
 ## Understanding the gap parameter
 
 The gap parameter in `THEN/N` and `NEAR/N` controls how many *extra* positions

@@ -18,16 +18,24 @@
 use crate::am::amhandler;
 use pgrx::{extension_sql, pg_extern, pg_sys};
 use tinql::runtime::{
-    Query, SimplificationProfile, evaluate, lower::lower, simplify, subtokenize::sub_tokenize,
-    tokenize_doc,
+    Query, SimplificationProfile, evaluate, lower::lower_with_profile, simplify,
+    subtokenize::sub_tokenize, tokenize_doc,
 };
 use tokenizer::Tokenizer;
 use tokenizer::presets::default_pipeline;
 
 fn parse_search<T: Tokenizer>(query_text: &str, tokenizer: &T) -> Result<Query, String> {
+    parse_search_with(query_text, tokenizer, SimplificationProfile::Structural)
+}
+
+fn parse_search_with<T: Tokenizer>(
+    query_text: &str,
+    tokenizer: &T,
+    profile: SimplificationProfile,
+) -> Result<Query, String> {
     let parsed = crate::tinql::parse(query_text).map_err(|e| e.to_string())?;
     let analyzed = sub_tokenize(parsed, tokenizer).map_err(|e| e.to_string())?;
-    lower(&analyzed).map_err(|e| e.to_string())
+    lower_with_profile(&analyzed, profile).map_err(|e| e.to_string())
 }
 
 /// Returns the OID of Lead's `==>(text, text)` operator, or `InvalidOid` if
@@ -79,9 +87,30 @@ fn invalid_search(error: String) -> ! {
 /// error `==>` raises for it. The parsed texts are ORed and simplified the way
 /// lowering simplifies `a OR b`.
 pub(crate) fn parse_searches<T: Tokenizer>(texts: &[String], tokenizer: &T) -> Query {
+    parse_searches_with(texts, tokenizer, SimplificationProfile::Structural)
+}
+
+/// Like [`parse_searches`], but keeps every written occurrence of a repeated
+/// term, which is what scoring weighs: `be AND be` weighs `be` twice.
+pub(crate) fn parse_scoring_searches<T: Tokenizer>(texts: &[String], tokenizer: &T) -> Query {
+    parse_searches_with(
+        texts,
+        tokenizer,
+        SimplificationProfile::StructuralPreserveTermMultiplicity,
+    )
+}
+
+fn parse_searches_with<T: Tokenizer>(
+    texts: &[String],
+    tokenizer: &T,
+    profile: SimplificationProfile,
+) -> Query {
     let mut queries = texts
         .iter()
-        .map(|text| parse_search(text, tokenizer).unwrap_or_else(|error| invalid_search(error)))
+        .map(|text| {
+            parse_search_with(text, tokenizer, profile)
+                .unwrap_or_else(|error| invalid_search(error))
+        })
         .collect::<Vec<_>>();
     if queries.len() == 1 {
         return queries.remove(0);
@@ -91,7 +120,7 @@ pub(crate) fn parse_searches<T: Tokenizer>(texts: &[String], tokenizer: &T) -> Q
             min: 1,
             children: queries,
         },
-        SimplificationProfile::Structural,
+        profile,
     )
 }
 

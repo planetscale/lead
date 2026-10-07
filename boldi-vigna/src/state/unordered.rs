@@ -16,7 +16,6 @@
 // The full license text is available in LICENSE.
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, VecDeque};
-use std::ops::Bound::{Excluded, Unbounded};
 
 use rustc_hash::FxHashMap;
 
@@ -27,13 +26,6 @@ use crate::query::SpanQuery;
 
 type StartKey = (u32, Reverse<u32>, usize);
 type EndKey = (u32, u32, usize);
-
-#[derive(Clone, Copy)]
-struct OperandInterval {
-    interval: Interval,
-    coverage: u64,
-    contains_overlap: bool,
-}
 
 enum UnorderedChild {
     Single(NodeState),
@@ -56,15 +48,9 @@ impl UnorderedChild {
         }
     }
 
-    fn next_interval(&mut self, positions: &impl TermPositions) -> Option<OperandInterval> {
+    fn next_interval(&mut self, positions: &impl TermPositions) -> Option<Interval> {
         match self {
-            Self::Single(state) => state
-                .next_interval(positions)
-                .map(|interval| OperandInterval {
-                    interval,
-                    coverage: u64::from(interval.width()),
-                    contains_overlap: false,
-                }),
+            Self::Single(state) => state.next_interval(positions),
             Self::Repeated(state) => state.next_interval(positions),
         }
     }
@@ -75,8 +61,6 @@ struct RepeatingState {
     child: NodeState,
     copies: usize,
     window: VecDeque<Interval>,
-    coverage: u64,
-    overlap_pairs: usize,
     exhausted: bool,
 }
 
@@ -87,8 +71,6 @@ impl RepeatingState {
             child,
             copies,
             window: VecDeque::with_capacity(copies),
-            coverage: 0,
-            overlap_pairs: 0,
             exhausted: false,
         }
     }
@@ -96,17 +78,15 @@ impl RepeatingState {
     fn reset(&mut self) {
         self.child.reset();
         self.window.clear();
-        self.coverage = 0;
-        self.overlap_pairs = 0;
         self.exhausted = false;
     }
 
-    fn next_interval(&mut self, positions: &impl TermPositions) -> Option<OperandInterval> {
+    fn next_interval(&mut self, positions: &impl TermPositions) -> Option<Interval> {
         if self.exhausted {
             return None;
         }
         if self.window.len() == self.copies {
-            self.pop_front();
+            self.window.pop_front();
         }
 
         while self.window.len() < self.copies {
@@ -114,53 +94,20 @@ impl RepeatingState {
                 self.exhausted = true;
                 return None;
             };
-            self.push_back(interval);
+            self.window.push_back(interval);
         }
 
         let start = self.window.front()?.start;
         let end = self.window.back()?.end;
-        Some(OperandInterval {
-            interval: Interval::new(start, end),
-            coverage: self.coverage,
-            contains_overlap: self.overlap_pairs != 0,
-        })
-    }
-
-    fn pop_front(&mut self) {
-        let Some(front) = self.window.pop_front() else {
-            return;
-        };
-        self.coverage -= u64::from(front.width());
-        if self
-            .window
-            .front()
-            .is_some_and(|next| front.overlaps(*next))
-        {
-            self.overlap_pairs -= 1;
-        }
-    }
-
-    fn push_back(&mut self, interval: Interval) {
-        if self
-            .window
-            .back()
-            .is_some_and(|previous| previous.overlaps(interval))
-        {
-            self.overlap_pairs += 1;
-        }
-        self.coverage += u64::from(interval.width());
-        self.window.push_back(interval);
+        Some(Interval::new(start, end))
     }
 }
 
 /// Indexed live intervals for an unordered conjunction.
 struct CurrentIntervals {
-    slots: Vec<Option<OperandInterval>>,
+    slots: Vec<Option<Interval>>,
     by_start: BTreeSet<StartKey>,
     by_end: BTreeSet<EndKey>,
-    coverage: u64,
-    overlap_pairs: usize,
-    overlapping_children: usize,
 }
 
 impl CurrentIntervals {
@@ -169,9 +116,6 @@ impl CurrentIntervals {
             slots: vec![None; children],
             by_start: BTreeSet::new(),
             by_end: BTreeSet::new(),
-            coverage: 0,
-            overlap_pairs: 0,
-            overlapping_children: 0,
         }
     }
 
@@ -179,9 +123,6 @@ impl CurrentIntervals {
         self.slots.fill(None);
         self.by_start.clear();
         self.by_end.clear();
-        self.coverage = 0;
-        self.overlap_pairs = 0;
-        self.overlapping_children = 0;
     }
 
     fn is_present(&self, child: usize) -> bool {
@@ -203,58 +144,19 @@ impl CurrentIntervals {
         Some(Interval::new(start, end))
     }
 
-    fn gaps(&self, span: Interval) -> Option<u64> {
-        if self.overlap_pairs != 0 || self.overlapping_children != 0 {
-            return None;
-        }
-        u64::from(span.width()).checked_sub(self.coverage)
-    }
-
-    fn replace(&mut self, child: usize, next: Option<OperandInterval>) {
+    fn replace(&mut self, child: usize, next: Option<Interval>) {
         if let Some(previous) = self.slots[child] {
-            self.unlink(child, previous);
-            self.coverage -= previous.coverage;
-            self.overlapping_children -= usize::from(previous.contains_overlap);
+            let removed_start = self.by_start.remove(&start_key(child, previous));
+            let removed_end = self.by_end.remove(&end_key(child, previous));
+            debug_assert!(removed_start && removed_end);
         }
 
         self.slots[child] = next;
         if let Some(next) = next {
-            self.link(child, next);
-            self.coverage += next.coverage;
-            self.overlapping_children += usize::from(next.contains_overlap);
+            let inserted_start = self.by_start.insert(start_key(child, next));
+            let inserted_end = self.by_end.insert(end_key(child, next));
+            debug_assert!(inserted_start && inserted_end);
         }
-    }
-
-    fn link(&mut self, child: usize, operand: OperandInterval) {
-        let key = start_key(child, operand.interval);
-        let (previous, next) = self.neighbors(key);
-        self.overlap_pairs -= overlapping_pair(previous, next);
-        self.overlap_pairs +=
-            overlapping_pair(previous, Some(key)) + overlapping_pair(Some(key), next);
-        let inserted_start = self.by_start.insert(key);
-        let inserted_end = self.by_end.insert(end_key(child, operand.interval));
-        debug_assert!(inserted_start && inserted_end);
-    }
-
-    fn unlink(&mut self, child: usize, operand: OperandInterval) {
-        let key = start_key(child, operand.interval);
-        let (previous, next) = self.neighbors(key);
-        self.overlap_pairs -=
-            overlapping_pair(previous, Some(key)) + overlapping_pair(Some(key), next);
-        self.overlap_pairs += overlapping_pair(previous, next);
-        let removed_start = self.by_start.remove(&key);
-        let removed_end = self.by_end.remove(&end_key(child, operand.interval));
-        debug_assert!(removed_start && removed_end);
-    }
-
-    fn neighbors(&self, key: StartKey) -> (Option<StartKey>, Option<StartKey>) {
-        let previous = self.by_start.range(..key).next_back().copied();
-        let next = self
-            .by_start
-            .range((Excluded(key), Unbounded))
-            .next()
-            .copied();
-        (previous, next)
     }
 }
 
@@ -266,24 +168,16 @@ fn end_key(child: usize, interval: Interval) -> EndKey {
     (interval.end, interval.start, child)
 }
 
-fn overlapping_pair(left: Option<StartKey>, right: Option<StartKey>) -> usize {
-    match (left, right) {
-        (Some((_, Reverse(left_end), _)), Some((right_start, _, _))) => {
-            usize::from(left_end >= right_start)
-        }
-        _ => 0,
-    }
-}
-
 /// BV AND algorithm: unordered conjunction.
 ///
 /// Finds minimal intervals containing one interval from each child,
-/// in any order. Uses ⪯ priority ordering (left-to-right).
+/// in any order. Uses ⪯ priority ordering (left-to-right). Children may
+/// overlap, so it reports no gap count: under a gap filter the compiler builds
+/// the disjoint form instead (see `NodeState::compile_gaps`).
 pub(crate) struct UnorderedState {
     children: Vec<UnorderedChild>,
     current: CurrentIntervals,
     prev: Option<Interval>,
-    last_gaps: Option<u64>,
 }
 
 impl UnorderedState {
@@ -313,7 +207,6 @@ impl UnorderedState {
             children,
             current,
             prev: None,
-            last_gaps: None,
         }
     }
 
@@ -323,7 +216,6 @@ impl UnorderedState {
         }
         self.current.reset();
         self.prev = None;
-        self.last_gaps = None;
     }
 
     fn advance_child(&mut self, child: usize, positions: &impl TermPositions) {
@@ -359,7 +251,6 @@ impl UnorderedState {
         }
 
         let mut candidate = self.current.span()?;
-        let mut candidate_gaps = self.current.gaps(candidate);
 
         loop {
             if self
@@ -380,15 +271,13 @@ impl UnorderedState {
                 break;
             }
             candidate = new_span;
-            candidate_gaps = self.current.gaps(candidate);
         }
 
         self.prev = Some(candidate);
-        self.last_gaps = candidate_gaps;
         Some(candidate)
     }
 
     pub(crate) fn gaps(&self) -> Option<u64> {
-        self.last_gaps
+        None
     }
 }
