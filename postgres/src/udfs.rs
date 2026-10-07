@@ -23,18 +23,19 @@ use tokenizer::{
 pub const MAX_TOKEN_BYTES: usize = 2_692;
 
 #[derive(Debug, Clone, Copy)]
-struct TokenizeOptions<'a> {
-    tokenizer: &'a str,
-    case_folding: &'a str,
-    accent_folding: &'a str,
-    long_tokens: &'a str,
-    max_token_bytes: i32,
-    graphemes: &'a str,
-    position_gaps: &'a str,
+pub(crate) struct TokenizeOptions<'a> {
+    pub(crate) tokenizer: &'a str,
+    pub(crate) case_folding: &'a str,
+    pub(crate) accent_folding: &'a str,
+    pub(crate) long_tokens: &'a str,
+    pub(crate) max_token_bytes: i32,
+    pub(crate) graphemes: &'a str,
+    pub(crate) position_gaps: &'a str,
+    pub(crate) stemmer: Option<&'a str>,
 }
 
 impl TokenizeOptions<'_> {
-    fn into_spec(self) -> Result<TokenizerPipelineSpec, String> {
+    pub(crate) fn into_spec(self) -> Result<TokenizerPipelineSpec, String> {
         let max_bytes = usize::try_from(self.max_token_bytes)
             .ok()
             .filter(|n| (tokenizer::MIN_TOKEN_BYTES..=MAX_TOKEN_BYTES).contains(n))
@@ -45,7 +46,7 @@ impl TokenizeOptions<'_> {
                 )
             })?;
 
-        Ok(TokenizerPipelineSpec {
+        let spec = TokenizerPipelineSpec {
             tokenizer: parse_tokenizer(self.tokenizer)?,
             case_folding: parse_folding("case_folding", self.case_folding)?,
             accent_folding: parse_folding("accent_folding", self.accent_folding)?,
@@ -55,7 +56,14 @@ impl TokenizeOptions<'_> {
             },
             graphemes: parse_graphemes(self.graphemes)?,
             position_gaps: parse_position_gaps(self.position_gaps)?,
-        })
+            stemmer: self
+                .stemmer
+                .map(str::parse)
+                .transpose()
+                .map_err(|error: tokenizer::TokenizerPipelineSpecError| error.to_string())?,
+        };
+        spec.validate().map_err(|error| error.to_string())?;
+        Ok(spec)
     }
 }
 
@@ -127,7 +135,7 @@ fn collect_tokens(text: &str, spec: TokenizerPipelineSpec) -> Vec<String> {
         .collect()
 }
 
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(name = "tokenize_v1_0_3", immutable, parallel_safe)]
 #[expect(clippy::too_many_arguments, reason = "TIN-compatible SQL signature")]
 pub fn tokenize<'a>(
     text: Option<&'a str>,
@@ -139,6 +147,32 @@ pub fn tokenize<'a>(
     graphemes: default!(&str, "'emoji'"),
     position_gaps: default!(&str, "'preserve'"),
 ) -> SetOfIterator<'a, String> {
+    tokenize_with_stemmer(
+        text,
+        tokenizer,
+        case_folding,
+        accent_folding,
+        long_tokens,
+        max_token_bytes,
+        graphemes,
+        position_gaps,
+        None,
+    )
+}
+
+#[pg_extern(name = "tokenize", immutable, parallel_safe)]
+#[expect(clippy::too_many_arguments, reason = "TIN-compatible SQL signature")]
+pub fn tokenize_with_stemmer<'a>(
+    text: Option<&'a str>,
+    tokenizer: default!(&str, "'unicode'"),
+    case_folding: default!(&str, "'fold'"),
+    accent_folding: default!(&str, "'fold'"),
+    long_tokens: default!(&str, "'split'"),
+    max_token_bytes: default!(i32, 256),
+    graphemes: default!(&str, "'emoji'"),
+    position_gaps: default!(&str, "'preserve'"),
+    stemmer: default!(Option<&str>, "NULL"),
+) -> SetOfIterator<'a, String> {
     let pipeline = compile_options(TokenizeOptions {
         tokenizer,
         case_folding,
@@ -147,6 +181,7 @@ pub fn tokenize<'a>(
         max_token_bytes,
         graphemes,
         position_gaps,
+        stemmer,
     });
     match text {
         Some(text) => SetOfIterator::new(
@@ -164,7 +199,7 @@ pub fn maybe_quote(text: Option<&str>) -> Option<String> {
     text.map(|text| tinql::maybe_quote(text).into_owned())
 }
 
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(name = "ql_parse_v1_0_3", immutable, parallel_safe)]
 #[expect(clippy::too_many_arguments, reason = "TIN-compatible SQL signature")]
 pub fn ql_parse(
     query: Option<&str>,
@@ -177,6 +212,34 @@ pub fn ql_parse(
     graphemes: default!(&str, "'emoji'"),
     position_gaps: default!(&str, "'preserve'"),
 ) -> Option<String> {
+    ql_parse_with_stemmer(
+        query,
+        surface,
+        tokenizer,
+        case_folding,
+        accent_folding,
+        long_tokens,
+        max_token_bytes,
+        graphemes,
+        position_gaps,
+        None,
+    )
+}
+
+#[pg_extern(name = "ql_parse", immutable, parallel_safe)]
+#[expect(clippy::too_many_arguments, reason = "TIN-compatible SQL signature")]
+pub fn ql_parse_with_stemmer(
+    query: Option<&str>,
+    surface: default!(bool, true),
+    tokenizer: default!(&str, "'unicode'"),
+    case_folding: default!(&str, "'fold'"),
+    accent_folding: default!(&str, "'fold'"),
+    long_tokens: default!(&str, "'split'"),
+    max_token_bytes: default!(i32, 256),
+    graphemes: default!(&str, "'emoji'"),
+    position_gaps: default!(&str, "'preserve'"),
+    stemmer: default!(Option<&str>, "NULL"),
+) -> Option<String> {
     let query = query?;
     let pipeline = compile_options(TokenizeOptions {
         tokenizer,
@@ -186,6 +249,7 @@ pub fn ql_parse(
         max_token_bytes,
         graphemes,
         position_gaps,
+        stemmer,
     });
     let parsed = crate::tinql::parse(query).unwrap_or_else(|error| pgrx::error!("{error}"));
     let analyzed = tinql::runtime::subtokenize::sub_tokenize(parsed, &pipeline)
@@ -215,6 +279,7 @@ mod tests {
             max_token_bytes: 32,
             graphemes: "retain",
             position_gaps: "collapse",
+            stemmer: None,
         }
         .into_spec()
         .unwrap();
@@ -247,6 +312,7 @@ mod tests {
             max_token_bytes: 3,
             graphemes: "emoji",
             position_gaps: "preserve",
+            stemmer: None,
         };
         assert!(options.into_spec().is_err());
     }

@@ -14,7 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 // The full license text is available in LICENSE.
-use crate::{Token, Tokenizer};
+use crate::{Token, TokenStream, Tokenizer};
 
 pub struct Whitespace;
 
@@ -54,6 +54,12 @@ impl<'a> Iterator for WhitespaceIter<'a> {
         let pos = self.pos;
         self.pos += 1;
         Some(Token::new(word, pos))
+    }
+}
+
+impl<'a> TokenStream<'a> for WhitespaceIter<'a> {
+    fn positions_consumed(&self) -> u32 {
+        self.pos
     }
 }
 

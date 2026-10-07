@@ -33,7 +33,7 @@ fn parse_search<T: Tokenizer>(query_text: &str, tokenizer: &T) -> Result<Query, 
 /// Returns the OID of Lead's `==>(text, text)` operator, or `InvalidOid` if
 /// it does not exist. It is looked up on each call because the extension can
 /// be dropped and recreated.
-fn search_operator() -> pg_sys::Oid {
+pub(crate) fn search_operator() -> pg_sys::Oid {
     unsafe {
         let mut names = std::ptr::null_mut();
         for name in [c"pg_catalog", c"==>"] {
@@ -96,7 +96,21 @@ pub(crate) fn parse_searches<T: Tokenizer>(texts: &[String], tokenizer: &T) -> Q
 }
 
 fn evaluate_text(document: &str, query_text: &str) -> Result<bool, String> {
-    let pipeline = default_pipeline();
+    let (config, query_text) = crate::analysis::split_tag(query_text);
+    match config {
+        Some(config) => {
+            let pipeline = crate::analysis::pipeline_for(config)?;
+            evaluate_with(&pipeline, document, query_text)
+        }
+        None => evaluate_with(default_pipeline(), document, query_text),
+    }
+}
+
+fn evaluate_with(
+    pipeline: &tokenizer::CompiledTokenizerPipeline,
+    document: &str,
+    query_text: &str,
+) -> Result<bool, String> {
     let query = parse_search(query_text, pipeline)?;
     let document = tokenize_doc(document, pipeline);
     evaluate(&query, &document)
@@ -148,6 +162,16 @@ mod tests {
     #[pg_test]
     fn empty_documents_do_not_match_match_all() {
         assert!(!evaluate_text("...", "*").unwrap());
+    }
+
+    #[pg_test]
+    fn bound_analysis_stems_the_raw_query_once() {
+        let mut spec = tokenizer::TokenizerPipelineSpec::tin_default();
+        spec.stemmer = Some(tokenizer::Stemmer::English);
+        let bound = crate::analysis::tag(&spec, "accidental");
+        assert!(evaluate_text("an accidental", &bound).unwrap());
+        assert!(!evaluate_text("an accident", &bound).unwrap());
+        assert!(!evaluate_text("an accidental", "accident").unwrap());
     }
 
     #[pg_test]

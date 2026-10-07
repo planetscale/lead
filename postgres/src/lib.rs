@@ -19,6 +19,8 @@ use pgrx::pg_guard;
 ::pgrx::pg_module_magic!(name);
 
 mod am;
+mod analysis;
+mod array_analysis;
 mod bm25;
 mod highlight;
 mod highlight_udfs;
@@ -33,6 +35,7 @@ mod udfs;
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     options::init();
+    array_analysis::init();
 }
 
 #[cfg(test)]
@@ -1169,6 +1172,325 @@ mod tests {
         .unwrap();
         assert!(ansi.contains("\x1b["));
         assert!(ansi.contains("Beer"));
+    }
+
+    #[pg_test]
+    fn stemmed_index_matches_inflected_words_everywhere() {
+        Spi::run(
+            "CREATE TABLE lite_stem (id int, body text);
+             INSERT INTO lite_stem VALUES
+               (1, 'molded'), (2, 'MOLDS'), (3, 'moldy'), (4, 'wine');
+             CREATE INDEX lite_stem_idx ON lite_stem USING tin (body)
+               WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        for setting in ["on", "off"] {
+            Spi::run(&format!("SET LOCAL enable_seqscan = {setting}")).unwrap();
+            assert_eq!(
+                Spi::get_one::<Vec<i32>>(
+                    "SELECT array_agg(id ORDER BY id) FROM lite_stem WHERE body ==> 'mold'"
+                )
+                .unwrap(),
+                Some(vec![1, 2]),
+                "enable_seqscan = {setting}"
+            );
+        }
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT count(*) FROM lite_stem a JOIN lite_stem b ON a.id = b.id
+                 WHERE b.body ==> 'molding'"
+            )
+            .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[pg_test]
+    fn cached_plans_follow_the_index_stemmer() {
+        Spi::run(
+            "CREATE TABLE lite_stem_cached (id int, body text);
+             INSERT INTO lite_stem_cached VALUES (1, 'molded'), (2, 'mold');
+             CREATE INDEX lite_stem_cached_idx ON lite_stem_cached USING tin (body)
+               WITH (stemmer = 'en');
+             SET LOCAL plan_cache_mode = force_generic_plan;
+             PREPARE lite_stem_query(text) AS
+               SELECT array_agg(id ORDER BY id) FROM lite_stem_cached WHERE body ==> $1;",
+        )
+        .unwrap();
+        let run = || {
+            Spi::get_one::<Vec<i32>>("EXECUTE lite_stem_query('molds')")
+                .unwrap()
+                .unwrap_or_default()
+        };
+        assert_eq!(run(), vec![1, 2]);
+        Spi::run(
+            "ALTER INDEX lite_stem_cached_idx RESET (stemmer);
+             REINDEX INDEX lite_stem_cached_idx;",
+        )
+        .unwrap();
+        assert!(run().is_empty());
+    }
+
+    fn ids(sql: &str) -> Vec<i32> {
+        Spi::get_one::<Vec<i32>>(sql).unwrap().unwrap_or_default()
+    }
+
+    #[pg_test]
+    fn any_searches_bind_the_index_analysis() {
+        Spi::run(
+            "CREATE TABLE lite_stem_any (id int, body text);
+             INSERT INTO lite_stem_any VALUES
+               (1, 'molded'), (2, 'wines'), (3, 'moldy'), (4, 'beer');
+             CREATE INDEX lite_stem_any_idx ON lite_stem_any USING tin (body)
+               WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        for setting in ["on", "off"] {
+            Spi::run(&format!("SET LOCAL enable_seqscan = {setting}")).unwrap();
+            for (array, expected) in [
+                ("ARRAY['mold']", vec![1]),
+                ("ARRAY['mold', NULL, 'wine']", vec![1, 2]),
+                ("'{mold,beers}'", vec![1, 4]),
+                ("ARRAY[]::text[]", vec![]),
+            ] {
+                assert_eq!(
+                    ids(&format!(
+                        "SELECT array_agg(id ORDER BY id) FROM lite_stem_any
+                         WHERE body ==> ANY({array})"
+                    )),
+                    expected,
+                    "{array}, enable_seqscan = {setting}"
+                );
+            }
+        }
+        assert_eq!(
+            Spi::get_one::<bool>(
+                "SELECT body ==> ANY(ARRAY['mold']) FROM lite_stem_any WHERE id = 1"
+            )
+            .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            ids("SELECT array_agg(id ORDER BY id) FROM lite_stem_any
+                 WHERE body ==> ANY(ARRAY['mold']) OR body ==> 'wine'"),
+            vec![1, 2]
+        );
+        assert_eq!(
+            ids("SELECT array_agg(id ORDER BY id) FROM lite_stem_any
+                 WHERE body ==> ALL(ARRAY['mold', 'molds'])"),
+            vec![1]
+        );
+    }
+
+    #[pg_test]
+    fn any_searches_stay_correct_in_cached_plans() {
+        Spi::run(
+            "CREATE TABLE lite_stem_any_cached (id int, body text);
+             INSERT INTO lite_stem_any_cached VALUES (1, 'molded'), (2, 'wines');
+             CREATE INDEX lite_stem_any_cached_idx ON lite_stem_any_cached USING tin (body)
+               WITH (stemmer = 'en');
+             PREPARE lite_stem_any_array(text[]) AS
+               SELECT array_agg(id ORDER BY id) FROM lite_stem_any_cached
+               WHERE body ==> ANY($1);
+             PREPARE lite_stem_any_const AS
+               SELECT array_agg(id ORDER BY id) FROM lite_stem_any_cached
+               WHERE body ==> ANY(ARRAY['mold']);",
+        )
+        .unwrap();
+        for mode in ["force_generic_plan", "force_custom_plan"] {
+            Spi::run(&format!("SET LOCAL plan_cache_mode = {mode}")).unwrap();
+            for _ in 0..7 {
+                assert_eq!(
+                    ids("EXECUTE lite_stem_any_array(ARRAY['mold', 'wine'])"),
+                    vec![1, 2],
+                    "{mode}"
+                );
+                assert_eq!(ids("EXECUTE lite_stem_any_const"), vec![1], "{mode}");
+            }
+        }
+        Spi::run(
+            "ALTER INDEX lite_stem_any_cached_idx RESET (stemmer);
+             REINDEX INDEX lite_stem_any_cached_idx;",
+        )
+        .unwrap();
+        assert!(ids("EXECUTE lite_stem_any_const").is_empty());
+        assert!(ids("EXECUTE lite_stem_any_array(ARRAY['mold'])").is_empty());
+    }
+
+    #[pg_test]
+    fn any_searches_bind_expression_indexes() {
+        Spi::run(
+            "CREATE TABLE lite_stem_any_expr (id int, body text);
+             INSERT INTO lite_stem_any_expr VALUES (1, 'Molded'), (2, 'beer');
+             CREATE INDEX ON lite_stem_any_expr USING tin ((lower(body)))
+               WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        assert_eq!(
+            ids("SELECT array_agg(id ORDER BY id) FROM lite_stem_any_expr
+                 WHERE lower(body) ==> ANY(ARRAY['mold'])"),
+            vec![1]
+        );
+        assert!(
+            ids("SELECT array_agg(id ORDER BY id) FROM lite_stem_any_expr
+                 WHERE body ==> ANY(ARRAY['molds'])")
+            .is_empty()
+        );
+    }
+
+    #[pg_test]
+    fn any_searches_bind_partitioned_indexes() {
+        Spi::run(
+            "CREATE TABLE lite_stem_any_parts (part int, id int, body text)
+               PARTITION BY LIST (part);
+             CREATE TABLE lite_stem_any_part1 PARTITION OF lite_stem_any_parts
+               FOR VALUES IN (1);
+             CREATE TABLE lite_stem_any_part2 PARTITION OF lite_stem_any_parts
+               FOR VALUES IN (2);
+             INSERT INTO lite_stem_any_parts VALUES
+               (1, 4, 'molded'), (2, 5, 'molds'), (2, 6, 'beer');
+             CREATE INDEX ON lite_stem_any_parts USING tin (body) WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        assert_eq!(
+            ids("SELECT array_agg(id ORDER BY id) FROM lite_stem_any_parts
+                 WHERE body ==> ANY(ARRAY['mold'])"),
+            vec![4, 5]
+        );
+    }
+
+    #[pg_test(
+        error = "tin index tokenization differs across the members of \"lite_stem_any_mixed\" for this search"
+    )]
+    fn any_searches_reject_conflicting_partition_analysis() {
+        Spi::run(
+            "CREATE TABLE lite_stem_any_mixed (part int, body text) PARTITION BY LIST (part);
+             CREATE TABLE lite_stem_any_mixed1 PARTITION OF lite_stem_any_mixed FOR VALUES IN (1);
+             CREATE TABLE lite_stem_any_mixed2 PARTITION OF lite_stem_any_mixed FOR VALUES IN (2);
+             CREATE INDEX ON lite_stem_any_mixed1 USING tin (body) WITH (stemmer = 'en');
+             CREATE INDEX ON lite_stem_any_mixed2 USING tin (body);",
+        )
+        .unwrap();
+        Spi::run("SELECT 1 FROM lite_stem_any_mixed WHERE body ==> ANY(ARRAY['mold'])").unwrap();
+    }
+
+    #[pg_test]
+    fn any_searches_bind_join_quals() {
+        Spi::run(
+            "CREATE TABLE lite_stem_any_join (id int, body text);
+             INSERT INTO lite_stem_any_join VALUES (1, 'molded'), (2, 'beer');
+             CREATE INDEX ON lite_stem_any_join USING tin (body) WITH (stemmer = 'en');
+             CREATE TABLE lite_stem_any_probe (id int, word text);
+             INSERT INTO lite_stem_any_probe VALUES (1, 'mold'), (2, 'wine');",
+        )
+        .unwrap();
+        assert_eq!(
+            ids("SELECT array_agg(p.id ORDER BY p.id)
+                 FROM lite_stem_any_probe p JOIN lite_stem_any_join j
+                   ON j.body ==> ANY(ARRAY[p.word])"),
+            vec![1]
+        );
+        assert_eq!(
+            ids("SELECT array_agg(j.id ORDER BY j.id)
+                 FROM lite_stem_any_probe p LEFT JOIN lite_stem_any_join j
+                   ON j.body ==> ANY(ARRAY['mold']) AND j.id = p.id
+                 WHERE j.id IS NOT NULL"),
+            vec![1]
+        );
+    }
+
+    #[pg_test]
+    fn explicit_highlights_bind_the_analysis_of_any_searches() {
+        Spi::run(
+            "CREATE TABLE lite_stem_any_highlight (body text);
+             INSERT INTO lite_stem_any_highlight VALUES ('Running and RUNS');
+             CREATE INDEX ON lite_stem_any_highlight USING tin (body) WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT tin.highlight(body, query => 'runs') FROM lite_stem_any_highlight
+                 WHERE body ==> ANY(ARRAY['run'])"
+            )
+            .unwrap(),
+            Some("<b>Running</b> and <b>RUNS</b>".into())
+        );
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT tin.highlight(body) FROM lite_stem_any_highlight
+                 WHERE body ==> ANY(ARRAY['run'])"
+            )
+            .unwrap(),
+            Some("Running and RUNS".into())
+        );
+    }
+
+    #[pg_test(error = "unknown stemmer language code: bogus")]
+    fn unknown_stemmer_languages_are_rejected() {
+        Spi::run(
+            "CREATE TABLE lite_stem_unknown (body text);
+             CREATE INDEX ON lite_stem_unknown USING tin (body) WITH (stemmer = 'bogus');",
+        )
+        .unwrap();
+    }
+
+    #[pg_test(error = "stemming requires case_folding = fold")]
+    fn stemming_requires_case_folding() {
+        Spi::run(
+            "CREATE TABLE lite_stem_case (body text);
+             CREATE INDEX ON lite_stem_case USING tin (body)
+               WITH (case_folding = preserve);
+             ALTER INDEX lite_stem_case_body_idx SET (stemmer = 'en');",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn highlights_bind_the_index_analysis() {
+        Spi::run(
+            "CREATE TABLE lite_stem_highlight (body text);
+             INSERT INTO lite_stem_highlight VALUES ('Running and RUNS');
+             CREATE INDEX ON lite_stem_highlight USING tin (body) WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        for call in [
+            "tin.highlight(body)",
+            "tin.highlight(body, query => 'runs')",
+            "tin.highlight_v1_0_3(body, query => 'running')",
+            "tin.highlight(body, stemmer => 'en')",
+        ] {
+            assert_eq!(
+                Spi::get_one::<String>(&format!(
+                    "SELECT {call} FROM lite_stem_highlight WHERE body ==> 'run'"
+                ))
+                .unwrap(),
+                Some("<b>Running</b> and <b>RUNS</b>".into()),
+                "{call}"
+            );
+        }
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT tin.highlight('Running and RUNS', query => 'runs', stemmer => 'en')"
+            )
+            .unwrap(),
+            Some("<b>Running</b> and <b>RUNS</b>".into())
+        );
+    }
+
+    #[pg_test(
+        error = "tin.highlight() analysis conflicts with the searched index; matching columns, including UNION ALL and partition children, must use the same analysis options"
+    )]
+    fn highlights_reject_analysis_that_conflicts_with_the_index() {
+        Spi::run(
+            "CREATE TABLE lite_stem_conflict (body text);
+             CREATE INDEX ON lite_stem_conflict USING tin (body) WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT tin.highlight(body, stemmer => 'fr')
+             FROM lite_stem_conflict WHERE body ==> 'runs'",
+        )
+        .unwrap();
     }
 }
 

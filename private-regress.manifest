@@ -28,3 +28,10 @@ highlight_nested_relation_undermark
 highlight_relation_witness_overmark
 highlight_ilike_filter
 or_near_highlight
+stemming
+stemming_canonical_unicode
+highlight_index_analysis
+highlight_expression_analysis
+highlight_having_analysis
+highlight_join_analysis
+highlight_null_analysis_defaults

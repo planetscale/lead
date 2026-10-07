@@ -14,7 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //
 // The full license text is available in LICENSE.
-use crate::{Classification, Token};
+use crate::{Classification, Token, TokenStream};
 use std::marker::PhantomData;
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 use unicode_segmentation::{GraphemeIndices, UnicodeSegmentation, UnicodeWords};
@@ -137,18 +137,17 @@ impl<'a, P> UnicodeIter<'a, P> {
         }
     }
 
-    /// Positions handed out so far, including tokens a later stage drops
-    /// (e.g. a combining-mark run that folds to empty keeps its gap
-    /// position). Final once the iterator returns `None`.
-    pub(crate) fn positions_consumed(&self) -> u32 {
-        self.pos
-    }
-
     #[inline]
     fn emit(&mut self, text: &'a str, classification: Classification) -> Token<'a> {
         let token = Token::with_classification(text, self.pos, classification);
         self.pos = self.pos.checked_add(1).expect("token position overflow");
         token
+    }
+}
+
+impl<'a, P: GraphemePolicy> TokenStream<'a> for UnicodeIter<'a, P> {
+    fn positions_consumed(&self) -> u32 {
+        self.pos
     }
 }
 

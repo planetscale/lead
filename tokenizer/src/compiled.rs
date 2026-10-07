@@ -16,11 +16,12 @@
 // The full license text is available in LICENSE.
 use crate::folder::{CompiledFolder, lowercase_ascii_from};
 use crate::long_tokens::LongTokenIter;
+use crate::normalizer::{CompiledNormalizer, NormalizerSpec};
 use crate::spec::{GraphemeMode, TokenizerPipelineSpec, TokenizerSpec};
 use crate::tokenizers::{
     DiscardGraphemes, EmojiGraphemes, RetainGraphemes, UnicodeIter, WhitespaceIter,
 };
-use crate::{Classification, Token, Tokenizer};
+use crate::{Classification, Token, TokenStream, Tokenizer};
 use unicode_normalization::char::is_combining_mark;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -35,7 +36,11 @@ impl CompiledTokenizerPipeline {
             CompiledPipelineKind::TinDefault
         } else {
             let stages = CompiledStages {
-                folder: CompiledFolder::new(spec.case_folding, spec.accent_folding),
+                normalizer: NormalizerSpec::new(
+                    spec.case_folding,
+                    spec.accent_folding,
+                    spec.stemmer,
+                ),
                 long_tokens: spec.long_tokens,
                 position_gaps: spec.position_gaps,
             };
@@ -68,11 +73,23 @@ impl Tokenizer for CompiledTokenizerPipeline {
     ) -> Self::Iter<'tokenizer, 'text> {
         CompiledTokenIter::new(&self.kind, text)
     }
+
+    fn tokenize_literal<'tokenizer, 'text>(
+        &'tokenizer self,
+        text: &'text str,
+    ) -> Self::Iter<'tokenizer, 'text> {
+        if self.spec.stemmer.is_none() {
+            return self.tokenize(text);
+        }
+        let mut spec = self.spec;
+        spec.stemmer = None;
+        CompiledTokenIter::new(&Self::from_validated_spec(spec).kind, text)
+    }
 }
 
 #[derive(Clone, Copy)]
 struct CompiledStages {
-    folder: CompiledFolder,
+    normalizer: NormalizerSpec,
     long_tokens: crate::LongTokenSpec,
     position_gaps: crate::PositionGapMode,
 }
@@ -85,14 +102,17 @@ enum CompiledPipelineKind {
     Whitespace(CompiledStages),
 }
 
-struct FolderIter<I, const DEFAULT: bool> {
+struct NormalizerIter<I, const DEFAULT: bool> {
     inner: I,
-    folder: CompiledFolder,
+    normalizer: CompiledNormalizer,
 }
 
-impl<I, const DEFAULT: bool> FolderIter<I, DEFAULT> {
-    fn new(inner: I, folder: CompiledFolder) -> Self {
-        Self { inner, folder }
+impl<I, const DEFAULT: bool> NormalizerIter<I, DEFAULT> {
+    fn new(inner: I, normalizer: NormalizerSpec) -> Self {
+        Self {
+            inner,
+            normalizer: normalizer.compile(),
+        }
     }
 
     fn inner(&self) -> &I {
@@ -100,7 +120,7 @@ impl<I, const DEFAULT: bool> FolderIter<I, DEFAULT> {
     }
 }
 
-impl<'text, I, const DEFAULT: bool> Iterator for FolderIter<I, DEFAULT>
+impl<'text, I, const DEFAULT: bool> Iterator for NormalizerIter<I, DEFAULT>
 where
     I: Iterator<Item = Token<'text>>,
 {
@@ -113,7 +133,7 @@ where
             if DEFAULT {
                 CompiledFolder::apply_case_and_accent(&mut token);
             } else {
-                self.folder.apply(&mut token);
+                self.normalizer.apply(&mut token);
             }
             if !token.text.is_empty() {
                 return Some(token);
@@ -126,7 +146,7 @@ struct PipelineIter<'text, I, const DEFAULT: bool>
 where
     I: Iterator<Item = Token<'text>>,
 {
-    inner: LongTokenIter<'text, FolderIter<I, DEFAULT>, DEFAULT>,
+    inner: LongTokenIter<'text, NormalizerIter<I, DEFAULT>, DEFAULT>,
 }
 
 impl<'text, I, const DEFAULT: bool> PipelineIter<'text, I, DEFAULT>
@@ -136,7 +156,7 @@ where
     fn new(inner: I, stages: CompiledStages) -> Self {
         Self {
             inner: LongTokenIter::new(
-                FolderIter::new(inner, stages.folder),
+                NormalizerIter::new(inner, stages.normalizer),
                 stages.long_tokens,
                 stages.position_gaps,
             ),
@@ -144,19 +164,11 @@ where
     }
 }
 
-impl<'text> PipelineIter<'text, UnicodeIter<'text, EmojiGraphemes>, true> {
-    /// Positions the exhausted pipeline consumed from its input: the
-    /// tokenizer's position counter (which already counts tokens the folder
-    /// later drops, so fold-to-empty gaps are included) plus one extra
-    /// position per 256-byte split continuation. Only meaningful after the
-    /// iterator returns `None`.
+impl<'text, I: TokenStream<'text>, const DEFAULT: bool> PipelineIter<'text, I, DEFAULT> {
+    // Read after exhaustion so the base counter includes discarded trailing tokens.
     fn positions_consumed(&self) -> u32 {
         self.inner
-            .inner()
-            .inner()
-            .positions_consumed()
-            .checked_add(self.inner.split_position_offset())
-            .expect("token position overflow")
+            .positions_consumed(self.inner.inner().inner().positions_consumed())
     }
 }
 
@@ -205,7 +217,7 @@ impl<'text> CompiledTokenIter<'text> {
 
 const fn default_stages() -> CompiledStages {
     CompiledStages {
-        folder: CompiledFolder::CaseAndAccent,
+        normalizer: NormalizerSpec::Fold(CompiledFolder::CaseAndAccent),
         long_tokens: crate::LongTokenSpec {
             mode: crate::LongTokenMode::Split,
             max_bytes: 256,
@@ -716,6 +728,19 @@ impl<'text> Iterator for CompiledTokenIter<'text> {
             CompiledTokenIterKind::UnicodeEmoji(iter) => iter.next(),
             CompiledTokenIterKind::UnicodeRetain(iter) => iter.next(),
             CompiledTokenIterKind::Whitespace(iter) => iter.next(),
+        }
+    }
+}
+
+impl<'text> TokenStream<'text> for CompiledTokenIter<'text> {
+    fn positions_consumed(&self) -> u32 {
+        match &self.inner {
+            CompiledTokenIterKind::TinDefaultAscii(iter) => iter.next_position,
+            CompiledTokenIterKind::TinDefaultMixed(iter) => iter.position_base,
+            CompiledTokenIterKind::UnicodeDiscard(iter) => iter.positions_consumed(),
+            CompiledTokenIterKind::UnicodeEmoji(iter) => iter.positions_consumed(),
+            CompiledTokenIterKind::UnicodeRetain(iter) => iter.positions_consumed(),
+            CompiledTokenIterKind::Whitespace(iter) => iter.positions_consumed(),
         }
     }
 }

@@ -17,7 +17,7 @@
 //! Sub-tokenization rewrite pass for the shared runtime.
 
 use crate::*;
-use tokenizer::Tokenizer;
+use tokenizer::{TokenStream, Tokenizer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SubTokenizeError {
@@ -41,9 +41,8 @@ struct AnalyzedToken {
     came_from_split: bool,
 }
 
-fn analyze<T: Tokenizer>(text: &str, tokenizer: &T) -> Vec<AnalyzedToken> {
-    tokenizer
-        .tokenize(text)
+fn analyze<'text>(tokens: impl Iterator<Item = tokenizer::Token<'text>>) -> Vec<AnalyzedToken> {
+    tokens
         .map(|token| {
             let pos = token.pos;
             let came_from_split = token.came_from_split();
@@ -64,7 +63,7 @@ fn rewrite<T: Tokenizer>(expr: Expr, tokenizer: &T) -> Result<Expr, SubTokenizeE
             prefix,
             distance,
         } => {
-            let tokens = analyze(&term, tokenizer);
+            let tokens = analyze(tokenizer.tokenize_literal(&term));
             if tokens.iter().any(|token| token.came_from_split) {
                 return Err(SubTokenizeError::SplitFuzzyTerm { term });
             }
@@ -200,7 +199,7 @@ fn rewrite_vec<T: Tokenizer>(
 }
 
 fn rewrite_term<T: Tokenizer>(s: &str, tokenizer: &T) -> Expr {
-    let tokens = analyze(s, tokenizer);
+    let tokens = analyze(tokenizer.tokenize(s));
     match tokens.len() {
         // A term whose analyzed token stream is empty (bare punctuation,
         // emoji) can never match a stored token: it matches nothing. Failing
@@ -286,7 +285,7 @@ fn flush_phrase_term_run<T: Tokenizer>(
         return;
     }
 
-    let text_bytes = terms.iter().map(String::len).sum::<usize>() + terms.len() + 1;
+    let text_bytes = terms.iter().map(String::len).sum::<usize>() + terms.len() - 1;
     let mut text = String::with_capacity(text_bytes);
     for term in terms.drain(..) {
         if !text.is_empty() {
@@ -294,32 +293,22 @@ fn flush_phrase_term_run<T: Tokenizer>(
         }
         text.push_str(&term);
     }
-    // A one-byte word survives every valid pipeline. Its final position makes
-    // positions consumed by discarded trailing terms observable without
-    // widening Tokenizer's streaming interface.
-    text.push_str(" a");
-
-    let mut tokens = analyze(&text, tokenizer);
-    let sentinel = tokens
-        .pop()
-        .expect("the phrase position sentinel must survive tokenization");
-    debug_assert_eq!(sentinel.text, "a");
-    debug_assert!(!sentinel.came_from_split);
-
+    let mut tokens = tokenizer.tokenize(&text);
     let mut previous_pos = None;
-    for token in tokens {
+    for token in tokens.by_ref() {
         let gap = previous_pos.map_or(token.pos, |previous: u32| {
             token.pos.saturating_sub(previous).saturating_sub(1)
         });
         *pending_gap = pending_gap.saturating_add(gap);
         push_pending_gap(out, pending_gap, *has_anchor);
         previous_pos = Some(token.pos);
-        out.push(PhraseElement::Term(token.text));
+        out.push(PhraseElement::Term(token.text.into_owned()));
         *has_anchor = true;
     }
 
-    let trailing_gap = previous_pos.map_or(sentinel.pos, |previous| {
-        sentinel.pos.saturating_sub(previous).saturating_sub(1)
+    let positions = tokens.positions_consumed();
+    let trailing_gap = previous_pos.map_or(positions, |previous| {
+        positions.saturating_sub(previous).saturating_sub(1)
     });
     *pending_gap = pending_gap.saturating_add(trailing_gap);
 }
@@ -363,7 +352,7 @@ fn rewrite_wildcard<T: Tokenizer>(
     for part in parts {
         match part {
             WildcardPart::Literal(s) => {
-                let tokens = analyze(&s, tokenizer);
+                let tokens = analyze(tokenizer.tokenize_literal(&s));
                 if tokens.iter().any(|token| token.came_from_split) {
                     return Err(SubTokenizeError::SplitWildcardLiteral { literal: s });
                 }
@@ -457,7 +446,7 @@ fn normalize_range_bound<T: Tokenizer>(
     match bound {
         RangeBound::Open => Ok(RangeBound::Open),
         RangeBound::Term(s) => {
-            let tokens = analyze(&s, tokenizer);
+            let tokens = analyze(tokenizer.tokenize_literal(&s));
             if tokens.iter().any(|token| token.came_from_split) {
                 return Err(SubTokenizeError::SplitRangeBound { bound: s });
             }
@@ -867,26 +856,71 @@ mod tests {
 
     #[test]
     fn quoted_phrase_carries_a_trailing_discard_gap_across_alternatives() {
-        let tokenizer = whitespace_pipeline(LongTokenMode::Discard, 4, PositionGapMode::Preserve);
-        let phrase = Expr::Phrase {
-            elements: vec![
-                PhraseElement::Term("aa".into()),
-                PhraseElement::Term("toolong".into()),
-                PhraseElement::Alternatives(vec![Expr::Term("cc".into())]),
-            ],
-            slop: None,
-        };
-        assert_eq!(
-            sub_tokenize(phrase, &tokenizer).unwrap(),
-            Expr::Phrase {
-                elements: vec![
-                    PhraseElement::Term("aa".into()),
-                    PhraseElement::Gap(1),
-                    PhraseElement::Alternatives(vec![Expr::Term("cc".into())]),
-                ],
-                slop: None,
+        for (text, mode, stemmer, surviving) in [
+            ("aa toolong", LongTokenMode::Discard, None, "aa"),
+            ("toolong", LongTokenMode::Discard, None, ""),
+            ("aa \u{0301}", LongTokenMode::Split, None, "aa"),
+            ("\u{0301}", LongTokenMode::Split, None, ""),
+            ("aa 👨‍👩‍👧‍👦", LongTokenMode::Truncate, None, "aa"),
+            (
+                "abcdefghij \u{0301}",
+                LongTokenMode::Split,
+                None,
+                "abcd efgh ij",
+            ),
+            (
+                "aa !!!",
+                LongTokenMode::Split,
+                Some(tokenizer::Stemmer::Arabic),
+                "aa",
+            ),
+            (
+                "!!!",
+                LongTokenMode::Split,
+                Some(tokenizer::Stemmer::Arabic),
+                "",
+            ),
+        ] {
+            for gaps in [PositionGapMode::Preserve, PositionGapMode::Collapse] {
+                let mut spec = *whitespace_pipeline(mode, 4, gaps).spec();
+                spec.case_folding = Folding::Fold;
+                spec.accent_folding = Folding::Fold;
+                spec.stemmer = stemmer;
+                let tokenizer = spec.compile().unwrap();
+                for explicit_gap in [0, 2] {
+                    let before = PhraseElement::Alternatives(vec![Expr::Term("zz".into())]);
+                    let after = PhraseElement::Alternatives(vec![Expr::Term("cc".into())]);
+                    let phrase = Expr::Phrase {
+                        elements: vec![
+                            before.clone(),
+                            PhraseElement::Term(text.into()),
+                            PhraseElement::Gap(explicit_gap),
+                            after.clone(),
+                        ],
+                        slop: None,
+                    };
+                    let mut elements = vec![before];
+                    elements.extend(
+                        surviving
+                            .split_whitespace()
+                            .map(|s| PhraseElement::Term(s.into())),
+                    );
+                    let gap = explicit_gap + u32::from(gaps == PositionGapMode::Preserve);
+                    if gap != 0 {
+                        elements.push(PhraseElement::Gap(gap));
+                    }
+                    elements.push(after);
+                    assert_eq!(
+                        sub_tokenize(phrase, &tokenizer).unwrap(),
+                        Expr::Phrase {
+                            elements,
+                            slop: None
+                        },
+                        "{text:?}, {mode:?}, {stemmer:?}, {gaps:?}, gap={explicit_gap}"
+                    );
+                }
             }
-        );
+        }
     }
 
     #[test]
@@ -947,5 +981,108 @@ mod tests {
             .expect("sub-tokenization should succeed");
 
         assert_eq!(rewritten, Expr::Regex("Beer.*".into()));
+    }
+
+    #[test]
+    fn stemming_applies_to_terms_and_phrases_but_not_pattern_literals() {
+        let mut spec = TokenizerPipelineSpec::tin_default();
+        spec.stemmer = Some(tokenizer::Stemmer::English);
+        let pipeline = spec.compile().unwrap();
+        for (query, expected) in [
+            (Expr::Term("RUNNING".into()), Expr::Term("run".into())),
+            (
+                Expr::Wildcard(vec![
+                    WildcardPart::Literal("RÚNNING".into()),
+                    WildcardPart::Any,
+                ]),
+                Expr::Regex("running.*".into()),
+            ),
+            (
+                Expr::Fuzzy {
+                    term: "RÚNNING".into(),
+                    prefix: 1,
+                    distance: 2,
+                },
+                Expr::Fuzzy {
+                    term: "running".into(),
+                    prefix: 1,
+                    distance: 2,
+                },
+            ),
+            (
+                Expr::Range {
+                    lower: RangeBound::Term("RÚNNING".into()),
+                    upper: RangeBound::Term("RUNS".into()),
+                },
+                Expr::Range {
+                    lower: RangeBound::Term("running".into()),
+                    upper: RangeBound::Term("runs".into()),
+                },
+            ),
+            (
+                Expr::Phrase {
+                    elements: vec![
+                        PhraseElement::Term("RUNNING".into()),
+                        PhraseElement::Term("RUNS".into()),
+                    ],
+                    slop: None,
+                },
+                Expr::Phrase {
+                    elements: vec![
+                        PhraseElement::Term("run".into()),
+                        PhraseElement::Term("run".into()),
+                    ],
+                    slop: None,
+                },
+            ),
+        ] {
+            assert_eq!(sub_tokenize(query, &pipeline).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn numeric_phrase_terms_survive_every_stemmer() {
+        for language in [
+            "ar", "da", "nl", "en", "fi", "fr", "de", "el", "hu", "it", "no", "pt", "ro", "ru",
+            "es", "sv", "ta", "tr",
+        ] {
+            let mut spec = TokenizerPipelineSpec::tin_default();
+            spec.stemmer = Some(language.parse().unwrap());
+            let pipeline = spec.compile().unwrap();
+            let phrase = Expr::Phrase {
+                elements: vec![PhraseElement::Term("0".into())],
+                slop: None,
+            };
+            assert_eq!(
+                sub_tokenize(phrase.clone(), &pipeline).unwrap(),
+                phrase,
+                "{language}"
+            );
+        }
+    }
+
+    #[test]
+    fn terms_inside_phrase_alternatives_are_stemmed_once() {
+        let mut spec = TokenizerPipelineSpec::tin_default();
+        spec.stemmer = Some(tokenizer::Stemmer::English);
+        let pipeline = spec.compile().unwrap();
+        // Snowball stems accidental -> accident -> accid across two passes.
+        let phrase = Expr::Phrase {
+            elements: vec![
+                PhraseElement::Term("accidental".into()),
+                PhraseElement::Alternatives(vec![Expr::Term("accidental".into())]),
+            ],
+            slop: None,
+        };
+        assert_eq!(
+            sub_tokenize(phrase, &pipeline).unwrap(),
+            Expr::Phrase {
+                elements: vec![
+                    PhraseElement::Term("accident".into()),
+                    PhraseElement::Alternatives(vec![Expr::Term("accident".into())]),
+                ],
+                slop: None,
+            }
+        );
     }
 }

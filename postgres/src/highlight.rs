@@ -19,7 +19,7 @@ use rustc_hash::FxHasher;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use thiserror::Error;
-use tokenizer::Tokenizer;
+use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_TERM_FALLBACK_PALETTE: [&str; 8] = [
@@ -104,13 +104,14 @@ enum HighlightStyle<'a> {
 }
 
 pub(crate) fn highlight_text(
+    pipeline: &CompiledTokenizerPipeline,
     text: &str,
     begin_tag: &str,
     end_tag: &str,
     positions: &[MatchPosition],
 ) -> Result<String, HighlightError> {
     highlight_text_with_tokenizer(
-        &tokenizer::presets::default_pipeline().source_spans(),
+        &pipeline.source_spans(),
         text,
         HighlightStyle::Html { begin_tag, end_tag },
         positions,
@@ -118,11 +119,12 @@ pub(crate) fn highlight_text(
 }
 
 pub(crate) fn highlight_text_ansi(
+    pipeline: &CompiledTokenizerPipeline,
     text: &str,
     positions: &[MatchPosition],
 ) -> Result<String, HighlightError> {
     highlight_text_with_tokenizer(
-        &tokenizer::presets::default_pipeline().source_spans(),
+        &pipeline.source_spans(),
         text,
         HighlightStyle::Ansi,
         positions,
@@ -160,9 +162,13 @@ pub(crate) fn rewrap_text(text: &str, wrap_to: usize) -> String {
 /// Evaluates a parsed query against the document text to produce match
 /// positions inline.
 ///
-/// Uses the built-in default analyzer pipeline for the document.
-pub(crate) fn query_positions(query: &tinql::runtime::Query, text: &str) -> Vec<MatchPosition> {
-    let doc = tinql::runtime::tokenize_doc(text, tokenizer::presets::default_pipeline());
+/// Uses the given analyzer pipeline for the document.
+pub(crate) fn query_positions(
+    pipeline: &CompiledTokenizerPipeline,
+    query: &tinql::runtime::Query,
+    text: &str,
+) -> Vec<MatchPosition> {
+    let doc = tinql::runtime::tokenize_doc(text, pipeline);
     let matches = tinql::runtime::evaluate_for_highlight(query, &doc);
     matches
         .into_iter()

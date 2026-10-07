@@ -25,16 +25,17 @@
 //! position.
 //!
 //! [`SourceSpanIter`] resolves that by walking the same base tokenizer and
-//! folding each token only to *drive policy decisions*, while always emitting
+//! normalizing each token only to *drive policy decisions*, while always emitting
 //! borrowed slices of the source. Its contract: one token per position the
 //! pipeline consumes, in position order, with `pos` equal to that position —
 //! under `position_gaps = preserve` that includes a whole-token placeholder
 //! for each gap position (folded-to-empty, discarded, or truncated-to-empty
 //! tokens), and a split token yields exactly as many slices as the pipeline
 //! emits chunks, cut at source grapheme boundaries mapped through folding.
+//! With stemming, every resulting chunk instead spans the entire original word.
 
-use crate::folder::CompiledFolder;
 use crate::long_tokens::{split_end, truncate_end};
+use crate::normalizer::{CompiledNormalizer, NormalizerSpec};
 use crate::spec::{
     GraphemeMode, LongTokenMode, LongTokenSpec, PositionGapMode, TokenizerPipelineSpec,
     TokenizerSpec,
@@ -42,7 +43,7 @@ use crate::spec::{
 use crate::tokenizers::{
     DiscardGraphemes, EmojiGraphemes, RetainGraphemes, UnicodeIter, WhitespaceIter,
 };
-use crate::{CompiledTokenizerPipeline, Token, Tokenizer};
+use crate::{CompiledTokenizerPipeline, Token, TokenStream, Tokenizer};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use unicode_segmentation::UnicodeSegmentation;
@@ -95,7 +96,7 @@ impl<'text> Iterator for BaseIter<'text> {
 
 pub struct SourceSpanIter<'text> {
     base: BaseIter<'text>,
-    folder: CompiledFolder,
+    normalizer: CompiledNormalizer,
     long_tokens: LongTokenSpec,
     preserve_gaps: bool,
     pending: VecDeque<Token<'text>>,
@@ -114,7 +115,8 @@ impl<'text> SourceSpanIter<'text> {
         };
         Self {
             base,
-            folder: CompiledFolder::new(spec.case_folding, spec.accent_folding),
+            normalizer: NormalizerSpec::new(spec.case_folding, spec.accent_folding, spec.stemmer)
+                .compile(),
             long_tokens: spec.long_tokens,
             preserve_gaps: spec.position_gaps == PositionGapMode::Preserve,
             pending: VecDeque::new(),
@@ -129,13 +131,6 @@ impl<'text> SourceSpanIter<'text> {
             .checked_add(1)
             .expect("token position overflow");
         token
-    }
-
-    /// The folded byte length of one source slice, without keeping the fold.
-    fn folded_len(&self, source: &str) -> usize {
-        let mut probe = Token::new(source, 0);
-        self.folder.apply(&mut probe);
-        probe.text.len()
     }
 
     /// Queue one source slice per chunk the pipeline emits for this token.
@@ -170,13 +165,22 @@ impl<'text> SourceSpanIter<'text> {
             chunk
         };
 
+        let CompiledNormalizer::Fold(folder) = &self.normalizer else {
+            // A stem can change anywhere in the word. Each post-stem chunk
+            // refers to that entire source word, including removed suffixes.
+            self.pending.extend(targets.iter().map(|_| chunk(source)));
+            return;
+        };
+
         // Source cluster boundaries with the folded byte length of everything
         // before them, closed by the end-of-token boundary.
         let mut folded_prefix = 0usize;
         let mut boundaries = Vec::new();
         for (offset, grapheme) in source.grapheme_indices(true) {
             boundaries.push((offset, folded_prefix));
-            folded_prefix += self.folded_len(grapheme);
+            let mut probe = Token::new(grapheme, 0);
+            folder.apply(&mut probe);
+            folded_prefix += probe.text.len();
         }
         boundaries.push((source.len(), folded_prefix));
 
@@ -222,7 +226,7 @@ impl<'text> Iterator for SourceSpanIter<'text> {
             };
 
             let mut folded = Token::with_classification(source, 0, token.classification);
-            self.folder.apply(&mut folded);
+            self.normalizer.apply(&mut folded);
             let consumes_gap_position = if folded.text.is_empty() {
                 true
             } else if folded.text.len() <= self.long_tokens.max_bytes {
@@ -254,6 +258,12 @@ impl<'text> Iterator for SourceSpanIter<'text> {
                 return Some(self.emit(token));
             }
         }
+    }
+}
+
+impl<'text> TokenStream<'text> for SourceSpanIter<'text> {
+    fn positions_consumed(&self) -> u32 {
+        self.next_pos
     }
 }
 

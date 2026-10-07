@@ -20,9 +20,11 @@ use std::fmt::Display;
 mod compiled;
 mod folder;
 mod long_tokens;
+mod normalizer;
 pub mod presets;
 mod source_spans;
 mod spec;
+mod stemmer;
 pub mod tokenizers;
 
 pub use compiled::CompiledTokenizerPipeline;
@@ -31,6 +33,7 @@ pub use spec::{
     Folding, GraphemeMode, LongTokenMode, LongTokenSpec, MIN_TOKEN_BYTES, PositionGapMode,
     TokenizerPipelineSpec, TokenizerPipelineSpecError, TokenizerSpec,
 };
+pub use stemmer::Stemmer;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -88,9 +91,17 @@ impl<'a> Token<'a> {
     }
 }
 
+/// A token iterator that accounts for positions consumed by discarded tokens.
+pub trait TokenStream<'text>: Iterator<Item = Token<'text>> {
+    /// Final position count, including preserved gaps and split continuations.
+    /// Call only after `next()` returns `None`; intermediate counts are unspecified.
+    /// With collapsed gaps, this equals the number of emitted tokens.
+    fn positions_consumed(&self) -> u32;
+}
+
 /// A [`Tokenizer`] converts a string into a stream of [`Token`]s.
 pub trait Tokenizer {
-    type Iter<'tokenizer, 'text>: Iterator<Item = Token<'text>>
+    type Iter<'tokenizer, 'text>: TokenStream<'text>
     where
         Self: 'tokenizer;
 
@@ -99,6 +110,14 @@ pub trait Tokenizer {
         &'tokenizer self,
         text: &'text str,
     ) -> Self::Iter<'tokenizer, 'text>;
+
+    /// Normalize query pattern literals, preserving their morphology.
+    fn tokenize_literal<'tokenizer, 'text>(
+        &'tokenizer self,
+        text: &'text str,
+    ) -> Self::Iter<'tokenizer, 'text> {
+        self.tokenize(text)
+    }
 }
 
 impl<T: Tokenizer> Tokenizer for &T {
@@ -112,5 +131,12 @@ impl<T: Tokenizer> Tokenizer for &T {
         text: &'text str,
     ) -> Self::Iter<'tokenizer, 'text> {
         (*self).tokenize(text)
+    }
+
+    fn tokenize_literal<'tokenizer, 'text>(
+        &'tokenizer self,
+        text: &'text str,
+    ) -> Self::Iter<'tokenizer, 'text> {
+        (*self).tokenize_literal(text)
     }
 }

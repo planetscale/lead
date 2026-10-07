@@ -38,10 +38,14 @@ impl<'text, I, const DEFAULT: bool> LongTokenIter<'text, I, DEFAULT>
 where
     I: Iterator<Item = Token<'text>>,
 {
-    /// Extra positions created by split continuations: each continuation
-    /// chunk after the first occupies one additional position.
-    pub(crate) fn split_position_offset(&self) -> u32 {
-        self.split_position_offset
+    pub(crate) fn positions_consumed(&self, base_positions: u32) -> u32 {
+        if DEFAULT || self.position_gaps == PositionGapMode::Preserve {
+            base_positions
+                .checked_add(self.split_position_offset)
+                .expect("token position overflow")
+        } else {
+            self.next_collapsed_pos
+        }
     }
 
     pub(crate) fn inner(&self) -> &I {
