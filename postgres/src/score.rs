@@ -505,6 +505,9 @@ fn select_read_only(sql: &str, failure: &str) -> Vec<Vec<Option<String>>> {
     })
 }
 
+/// Tokenizes the corpus for scoring statistics. As in tin, a document with no
+/// tokens is not searchable, so it counts toward neither N nor the average
+/// document length.
 fn tokenize_documents<'a>(
     documents: impl Iterator<Item = &'a str>,
     tokenizer: &CompiledTokenizerPipeline,
@@ -517,6 +520,7 @@ fn tokenize_documents<'a>(
             }
             tokenize(tokenizer, document)
         })
+        .filter(|tokens| !tokens.is_empty())
         .collect()
 }
 

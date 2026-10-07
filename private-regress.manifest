@@ -37,3 +37,4 @@ highlight_join_analysis
 highlight_null_analysis_defaults
 phrase_repeat_weights
 tinql_query_length_limit
+or_dnf_factored_scores
