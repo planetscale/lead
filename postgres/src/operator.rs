@@ -33,7 +33,7 @@ fn parse_search<T: Tokenizer>(query_text: &str, tokenizer: &T) -> Result<Query, 
 /// Returns the OID of Lead's `==>(text, text)` operator, or `InvalidOid` if
 /// it does not exist. It is looked up on each call because the extension can
 /// be dropped and recreated.
-fn search_operator() -> pg_sys::Oid {
+pub(crate) fn search_operator() -> pg_sys::Oid {
     unsafe {
         let mut names = std::ptr::null_mut();
         for name in [c"pg_catalog", c"==>"] {

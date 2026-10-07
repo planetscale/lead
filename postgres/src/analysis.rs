@@ -143,9 +143,27 @@ pub(crate) fn pipeline_for(config: &str) -> Result<Rc<CompiledTokenizerPipeline>
     })
 }
 
+/// Binds an encoded analysis configuration to one search text.
+pub(crate) fn bind_text(analysis: &str, text: &str) -> String {
+    format!("{TAG}{analysis}{SEPARATOR}{}", raw_query(text))
+}
+
 #[pg_extern(immutable, parallel_safe)]
 fn bind_query_analysis(query: &str, analysis: &str) -> String {
-    format!("{TAG}{analysis}{SEPARATOR}{}", raw_query(query))
+    bind_text(analysis, query)
+}
+
+/// Binds an encoded analysis configuration to every search text of an array.
+pub(crate) fn bind_texts(analysis: &str, queries: Vec<Option<String>>) -> Vec<Option<String>> {
+    queries
+        .into_iter()
+        .map(|text| text.map(|text| bind_text(analysis, &text)))
+        .collect()
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn bind_query_array_analysis(queries: Vec<Option<String>>, analysis: &str) -> Vec<Option<String>> {
+    bind_texts(analysis, queries)
 }
 
 pub(crate) unsafe fn sibling_function(
@@ -441,6 +459,29 @@ pub(crate) unsafe fn conflict_scope(
     }
 }
 
+/// Finds the analysis a search over `operand` has to use when it differs from
+/// the default, and makes the plan depend on the indexes that decided it.
+/// Raises an error when the members of a partitioned, inherited, or UNION ALL
+/// relation analyze the operand differently.
+pub(crate) unsafe fn bound_analysis(
+    root: *mut pg_sys::PlannerInfo,
+    operand: *mut pg_sys::Node,
+) -> Option<TokenizerPipelineSpec> {
+    unsafe {
+        crate::score::single_varno(operand)?;
+        let (spec, indexes) = match resolve(root, operand) {
+            Resolution::Unindexed => return None,
+            Resolution::Conflict => pgrx::error!(
+                "tin index tokenization differs across the members of \"{}\" for this search",
+                conflict_scope(root, operand)
+            ),
+            Resolution::Bound { spec, indexes } => (spec, indexes),
+        };
+        depend_on_indexes(root, &indexes);
+        (spec != TokenizerPipelineSpec::tin_default()).then_some(spec)
+    }
+}
+
 fn unhandled() -> Internal {
     Internal::from(Some(pg_sys::Datum::from(0_usize)))
 }
@@ -475,21 +516,9 @@ fn tin_text_support(request: Internal) -> Internal {
         {
             return unhandled();
         }
-        if crate::score::single_varno(left).is_none() {
+        let Some(spec) = bound_analysis(request.root, left) else {
             return unhandled();
-        }
-        let (spec, indexes) = match resolve(request.root, left) {
-            Resolution::Unindexed => return unhandled(),
-            Resolution::Conflict => pgrx::error!(
-                "tin index tokenization differs across the members of \"{}\" for this search",
-                conflict_scope(request.root, left)
-            ),
-            Resolution::Bound { spec, indexes } => (spec, indexes),
         };
-        depend_on_indexes(request.root, &indexes);
-        if spec == TokenizerPipelineSpec::tin_default() {
-            return unhandled();
-        }
         let bound_right: *mut pg_sys::Node = match text_of(right) {
             Some(text) => text_const(&tag(&spec, &text)).cast(),
             None => {

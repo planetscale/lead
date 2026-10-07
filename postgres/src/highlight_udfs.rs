@@ -298,6 +298,10 @@ fn highlight_ansi_bound(
 struct QueryContext {
     document: *mut pg_sys::Node,
     queries: Vec<*mut pg_sys::Node>,
+    /// Whether a `==> ANY(...)` qual searches the document. Like tin, only
+    /// `==>` quals supply an implicit query, but any search on the document
+    /// binds the analysis of the index that covers it.
+    array_search: bool,
 }
 
 #[pg_guard]
@@ -313,6 +317,20 @@ unsafe extern "C-unwind" fn collect_queries(node: *mut pg_sys::Node, context: *m
         && unsafe { crate::score::same_operand(document, context.document) }
     {
         context.queries.push(unsafe { unbound_query(query) });
+    }
+    if unsafe { (*node).type_ } == pg_sys::NodeTag::T_ScalarArrayOpExpr {
+        let saop = node.cast::<pg_sys::ScalarArrayOpExpr>();
+        if unsafe { (*saop).opno } == crate::operator::search_operator()
+            && unsafe { pg_sys::list_length((*saop).args) } == 2
+            && unsafe {
+                crate::score::same_operand(
+                    pg_sys::list_nth((*saop).args, 0).cast(),
+                    context.document,
+                )
+            }
+        {
+            context.array_search = true;
+        }
     }
     unsafe {
         pg_sys::expression_tree_walker(
@@ -480,13 +498,14 @@ fn highlight_support(request: Internal) -> Internal {
         let mut binding = QueryContext {
             document,
             queries: Vec::new(),
+            array_search: false,
         };
         // Pulled-up subqueries leave their quals in nested FromExpr nodes.
         collect_queries(
             (*(*request.root).parse).jointree.cast::<pg_sys::Node>(),
             (&mut binding as *mut QueryContext).cast(),
         );
-        if binding.queries.is_empty() {
+        if binding.queries.is_empty() && !binding.array_search {
             return unhandled();
         }
         crate::analysis::depend_on_indexes(request.root, &indexes);
@@ -495,6 +514,9 @@ fn highlight_support(request: Internal) -> Internal {
             .expect("highlight has a query argument");
         let implicit = (*supplied_query).type_ == pg_sys::NodeTag::T_Const
             && (*supplied_query.cast::<pg_sys::Const>()).constisnull;
+        if implicit && binding.queries.is_empty() {
+            return unhandled();
+        }
         if implicit
             && query_needs_other_relations(request.root, request.fcall, document, &binding.queries)
         {
