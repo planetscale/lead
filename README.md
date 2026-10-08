@@ -22,6 +22,30 @@ cargo pgrx run pg18 --package tin
 
 Then run `CREATE EXTENSION tin` in the database. Lead loads on demand and does not require `shared_preload_libraries` or `session_preload_libraries`.
 
+## Docker
+
+The `Dockerfile` builds an image of the official Postgres image plus Lead. It is a debug build on purpose, with debug assertions and full stack traces, for development and CI. Do not use it in production.
+
+```sh
+docker build --build-arg PG_MAJOR=18 -t lead:pg18 .
+```
+
+`PG_MAJOR` can be 17 or 18. To build for both architectures, use buildx:
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg PG_MAJOR=18 -t lead:pg18 .
+```
+
+Run the image like the official Postgres image. It runs `CREATE EXTENSION tin` in the default database on first start:
+
+```sh
+docker run -d --name lead -p 5432:5432 -e POSTGRES_PASSWORD=secret lead:pg18
+psql postgresql://postgres:secret@localhost:5432/postgres
+docker exec -it lead psql -U postgres
+```
+
+Prebuilt images for amd64 and arm64 are on Docker Hub as `planetscale/lead:pg17` and `planetscale/lead:pg18` (also `latest`), and as `planetscale/lead:<version>-pg<N>`. Each push to `main` also publishes `planetscale/lead:<commit>-pg<N>`, where `<commit>` is the first 12 characters of the commit hash, so you can pin an exact build.
+
 ## Compatibility boundary
 
 Lead provides the `tin` access method, the `==>` operator, TINQL parsing, tokenizer and index reloptions (including the Snowball `stemmer` option), and the scoring functions `tin.score`, `tin.full_score`, `tin.max_score`, and `tin.score_inspect`, plus explicit and implicitly bound `tin.highlight` and `tin.highlight_ansi`. Postgres 17 and 18 are build targets. Search results are exact because the access method returns whole-page candidates and Postgres evaluates `==>` against each visible heap tuple, including expression and partial-index rechecks.

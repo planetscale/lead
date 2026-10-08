@@ -1,0 +1,7 @@
+.git
+.github
+target/
+tmp/
+tinql/docs/book/
+Dockerfile
+.dockerignore
