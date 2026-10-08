@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Usage: docker/in-builder IMAGE WORK_DIR COMMAND...
+#
+# Runs COMMAND in the builder stage image as the postgres user, with the
+# source tree read-only at /src.  WORK_DIR keeps the cargo caches, the
+# target directory, and the `cargo pgrx package` output (WORK_DIR/out)
+# between runs.
+
+set -euo pipefail
+
+image=$1
+work_dir=$2
+shift 2
+
+for dir in registry git target out; do
+    mkdir -p "$work_dir/$dir"
+    chmod a+rwx "$work_dir/$dir"
+done
+
+exec docker run --rm --user postgres \
+    --env CARGO_TERM_COLOR --env RUST_BACKTRACE --env CARGO_TARGET_DIR=/target \
+    --volume "$PWD:/src:ro" \
+    --volume "$work_dir/registry:/usr/local/cargo/registry" \
+    --volume "$work_dir/git:/usr/local/cargo/git" \
+    --volume "$work_dir/target:/target" \
+    --volume "$work_dir/out:/out" \
+    "$image" "$@"

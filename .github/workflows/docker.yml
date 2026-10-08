@@ -1,4 +1,4 @@
-name: Docker
+name: CI
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: docker-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -16,8 +16,8 @@ env:
   DOCKERHUB_OIDC_CONNECTIONID: 00074362-4196-4eb3-91cd-8b07dfdd71c7
 
 jobs:
-  docker:
-    name: Docker ${{ matrix.arch.name }} / PostgreSQL ${{ matrix.postgres }}
+  build-and-test:
+    name: ${{ matrix.arch.name }} / PostgreSQL ${{ matrix.postgres }}
     runs-on: ${{ matrix.arch.runner }}
     permissions:
       contents: read
@@ -35,18 +35,46 @@ jobs:
             docker: arm64
         postgres: [17, 18]
 
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      PG_MAJOR: ${{ matrix.postgres }}
+
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Build image
-        env:
-          PG_MAJOR: ${{ matrix.postgres }}
-        run: docker build --build-arg "PG_MAJOR=${PG_MAJOR}" --tag "lead:pg${PG_MAJOR}" .
+      - name: Build builder image
+        run: docker build --target builder --build-arg "PG_MAJOR=${PG_MAJOR}" --tag lead-builder .
 
-      - name: Smoke test
-        env:
-          PG_MAJOR: ${{ matrix.postgres }}
+      - name: Build
+        run: |
+          docker/in-builder lead-builder "$RUNNER_TEMP/work" \
+            cargo build --locked --package tin --no-default-features --features "pg${PG_MAJOR}"
+
+      - name: Clippy
+        run: |
+          docker/in-builder lead-builder "$RUNNER_TEMP/work" \
+            cargo clippy --locked --workspace --all-targets --no-default-features \
+              --features "pg${PG_MAJOR} pg_test" -- -D warnings
+
+      - name: Test local suite
+        run: |
+          docker/in-builder lead-builder "$RUNNER_TEMP/work" \
+            cargo pgrx test "pg${PG_MAJOR}" --package tin --no-default-features --features "pg${PG_MAJOR}"
+
+      - name: Package extension
+        run: |
+          docker/in-builder lead-builder "$RUNNER_TEMP/work" \
+            cargo pgrx package --debug --package tin --no-default-features --features "pg${PG_MAJOR}" \
+              --pg-config "/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config" --out-dir /out
+
+      - name: Build image
+        run: |
+          docker build --build-arg "PG_MAJOR=${PG_MAJOR}" \
+            --build-context "artifacts=$RUNNER_TEMP/work/out" --tag "lead:pg${PG_MAJOR}" .
+
+      - name: Smoke test image
         run: |
           docker run --detach --name lead --env POSTGRES_PASSWORD=postgres "lead:pg${PG_MAJOR}"
           for _ in $(seq 60); do
@@ -63,7 +91,7 @@ jobs:
 
       - name: Show container logs
         if: failure()
-        run: docker logs lead
+        run: docker logs lead || true
 
       - name: Log in to Docker Hub
         if: github.ref == 'refs/heads/main'
@@ -74,7 +102,6 @@ jobs:
       - name: Push image
         if: github.ref == 'refs/heads/main'
         env:
-          PG_MAJOR: ${{ matrix.postgres }}
           ARCH: ${{ matrix.arch.docker }}
         run: |
           docker tag "lead:pg${PG_MAJOR}" "${IMAGE}:${GITHUB_SHA::12}-pg${PG_MAJOR}-${ARCH}"
@@ -83,7 +110,7 @@ jobs:
   manifest:
     name: Manifest / PostgreSQL ${{ matrix.postgres }}
     if: github.ref == 'refs/heads/main'
-    needs: docker
+    needs: build-and-test
     runs-on: ubuntu-24.04
     permissions:
       contents: read
